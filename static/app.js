@@ -810,3 +810,4 @@ restartGameButton.addEventListener("click", restartGame);
 restoreSession();
 copyRoomCodeButton.addEventListener("click", copyRoomCode);
 saveSettingsButton.addEventListener("click", saveRoomSettings);
+// teste//

@@ -1,5 +1,6 @@
-from random import randrange, sample
-from secrets import token_hex
+import asyncio
+from random import choice, sample
+from secrets import compare_digest, token_hex
 from app.ai_questions import generate_question
 
 rooms = {}
@@ -62,9 +63,12 @@ def create_room(host_name):
                 "name": host_name,
                 "score": 0,
                 "is_host": True,
+                "connection_status": "offline",
             }
         ],
-        "current_player_index": 0,
+        "player_tokens": {host_id: token_hex(24)},
+        "current_player_index": None,
+        "turn_number": 0,
         "available_themes": [],
         "selected_theme": None,
         "selected_difficulty": None,
@@ -81,6 +85,14 @@ def create_room(host_name):
 
 def get_room(room_code):
     return rooms.get(room_code.upper())
+
+
+def get_session_player(room, player_id, session_token):
+    expected_token = room["player_tokens"].get(player_id)
+    if expected_token is None or not session_token.isascii() or not compare_digest(expected_token, session_token):
+        return None
+
+    return next((player for player in room["players"] if player["id"] == player_id), None)
 
 
 def join_room(room_code, player_name):
@@ -106,13 +118,43 @@ def join_room(room_code, player_name):
             "name": player_name,
             "score": 0,
             "is_host": False,
+            "connection_status": "offline",
         }
     )
+    room["player_tokens"][player_id] = token_hex(24)
 
     return room, player_id
 
 def choose_themes(amount=5):
     return sample(THEMES_POOL, amount)
+
+
+def prepare_turn(room, player_index):
+    room["current_player_index"] = player_index
+    room["turn_number"] += 1
+    room["available_themes"] = choose_themes() if player_index is not None else []
+    room["selected_theme"] = None
+    room["selected_difficulty"] = None
+    room["current_question"] = None
+
+
+def start_random_turn(room):
+    online_indices = [
+        index for index, player in enumerate(room["players"])
+        if player["connection_status"] == "online"
+    ]
+    prepare_turn(room, choice(online_indices) if online_indices else None)
+
+
+def advance_turn(room, start_index):
+    players = room["players"]
+    for offset in range(len(players)):
+        index = (start_index + offset) % len(players)
+        if players[index]["connection_status"] == "online":
+            prepare_turn(room, index)
+            return
+
+    prepare_turn(room, None)
 
 
 def start_game(room_code, player_id):
@@ -125,21 +167,18 @@ def start_game(room_code, player_id):
         return None
 
     room["status"] = "playing"
-    room["current_player_index"] = randrange(len(room["players"]))
-    room["available_themes"] = choose_themes()
-    room["selected_theme"] = None
-    room["selected_difficulty"] = None
-    room["current_question"] = None
+    start_random_turn(room)
     room["winner"] = None
     room["last_answer_result"] = None
 
     return room
 
 def get_current_player(room):
-    if not room["players"]:
+    player_index = room["current_player_index"]
+    if player_index is None or not room["players"]:
         return None
 
-    return room["players"][room["current_player_index"]]
+    return room["players"][player_index]
 
 def serialize_room(room):
     if room is None:
@@ -147,6 +186,7 @@ def serialize_room(room):
 
     room_data = room.copy()
     room_data.pop("asked_questions", None)
+    room_data.pop("player_tokens", None)
     room_data["current_player"] = get_current_player(room)
 
     if room_data["current_question"] is not None:
@@ -173,16 +213,27 @@ def select_theme(room_code, player_id, theme):
     if current_player["id"] != player_id:
         return None
 
+    if room["selected_difficulty"] is not None:
+        return None
+
     if theme not in room["available_themes"]:
         return None
 
     room["selected_theme"] = theme
-    room["current_question"] = None
 
     return room
 
 
-def select_difficulty(room_code, player_id, difficulty):
+def set_current_question(room, question, *, regenerated=False):
+    question["id"] = token_hex(8)
+    question["regenerated"] = regenerated
+    base_points = POINTS_BY_DIFFICULTY[question["difficulty"]]
+    question["points"] = max(1, base_points - 1) if regenerated else base_points
+    room["current_question"] = question
+    room["asked_questions"].append(question["question"])
+
+
+async def select_difficulty(room_code, player_id, difficulty):
 
     room = get_room(room_code)
 
@@ -203,23 +254,30 @@ def select_difficulty(room_code, player_id, difficulty):
     if room["selected_theme"] is None:
         return None
     
-    if room["current_question"] is not None:
+    if room["selected_difficulty"] is not None:
         return None
 
     if difficulty not in ["facil", "medio", "dificil"]:
         return None
 
+    turn_number = room["turn_number"]
     room["selected_difficulty"] = difficulty
-    question = generate_question(
-    room["selected_theme"],
-    difficulty,
-    room["asked_questions"],
-)
-    question["id"] = token_hex(8)
+    question = None
+    try:
+        question = await asyncio.to_thread(
+            generate_question,
+            room["selected_theme"],
+            difficulty,
+            room["asked_questions"].copy(),
+        )
+    finally:
+        if question is None and room["turn_number"] == turn_number:
+            room["selected_difficulty"] = None
 
-    room["selected_difficulty"] = difficulty
-    room["current_question"] = question
-    room["asked_questions"].append(question["question"])
+    if get_room(room_code) is not room or room["turn_number"] != turn_number:
+        return None
+
+    set_current_question(room, question)
 
     return room
 
@@ -229,18 +287,13 @@ def next_turn(room_code):
     if room is None:
         return None
 
-    room["current_player_index"] += 1
-    room["current_player_index"] %= len(room["players"])
-
-    room["available_themes"] = choose_themes()
-    room["selected_theme"] = None
-    room["selected_difficulty"] = None
-    room["current_question"] = None
+    current_index = room["current_player_index"]
+    advance_turn(room, 0 if current_index is None else current_index + 1)
 
     return room
 
 
-def answer_question(room_code, player_id, answer):
+def answer_question(room_code, player_id, answer, question_id=None):
     room = get_room(room_code)
 
     if room is None:
@@ -257,10 +310,14 @@ def answer_question(room_code, player_id, answer):
     if current_player["id"] != player_id:
         return None
 
-    if room["current_question"] is None:
+    question = room["current_question"]
+    if question is None or question.get("regenerating"):
         return None
 
-    correct_answer = room["current_question"]["correct_answer"]
+    if (question_id is not None or question.get("regenerated")) and question["id"] != question_id:
+        return None
+
+    correct_answer = question["correct_answer"]
     is_correct = answer == correct_answer
 
     result = {
@@ -270,7 +327,7 @@ def answer_question(room_code, player_id, answer):
     }
 
     if is_correct:
-        points = POINTS_BY_DIFFICULTY[room["selected_difficulty"]]
+        points = question.get("points", POINTS_BY_DIFFICULTY[room["selected_difficulty"]])
         current_player["score"] += points
         result["points_earned"] = points
     else:
@@ -307,11 +364,9 @@ def leave_room(room_code, player_id):
     if player_index is None:
         return None
 
-    was_current_player = (
-        room["players"][player_index]["id"] == get_current_player(room)["id"]
-    )
-
+    current_index = room["current_player_index"]
     removed_player = room["players"].pop(player_index)
+    del room["player_tokens"][player_id]
 
     if not room["players"]:
         del rooms[room["code"]]
@@ -321,17 +376,13 @@ def leave_room(room_code, player_id):
         room["host_id"] = room["players"][0]["id"]
         room["players"][0]["is_host"] = True
 
-    if player_index < room["current_player_index"]:
+    if current_index == player_index:
+        if room["status"] == "playing":
+            advance_turn(room, player_index)
+        else:
+            room["current_player_index"] = None
+    elif current_index is not None and player_index < current_index:
         room["current_player_index"] -= 1
-
-    if room["current_player_index"] >= len(room["players"]):
-        room["current_player_index"] = 0
-
-    if was_current_player:
-        room["available_themes"] = choose_themes()
-        room["selected_theme"] = None
-        room["selected_difficulty"] = None
-        room["current_question"] = None
 
     return room
 
@@ -348,11 +399,7 @@ def restart_game(room_code, player_id):
         player["score"] = 0
 
     room["status"] = "playing"
-    room["current_player_index"] = randrange(len(room["players"]))
-    room["available_themes"] = choose_themes()
-    room["selected_theme"] = None
-    room["selected_difficulty"] = None
-    room["current_question"] = None
+    start_random_turn(room)
     room["last_answer_result"] = None
     room["winner"] = None
     room["asked_questions"] = []
@@ -368,10 +415,11 @@ def timeout_question(room_code, question_id):
     if room["status"] != "playing":
         return None
 
-    if room["current_question"] is None:
+    question = room["current_question"]
+    if question is None or question.get("regenerating"):
         return None
 
-    if room["current_question"].get("id") != question_id:
+    if question.get("id") != question_id:
         return None
 
     current_player = get_current_player(room)
@@ -379,7 +427,7 @@ def timeout_question(room_code, question_id):
     if current_player is None:
         return None
 
-    correct_answer = room["current_question"]["correct_answer"]
+    correct_answer = question["correct_answer"]
 
     room["last_answer_result"] = {
         "is_correct": False,

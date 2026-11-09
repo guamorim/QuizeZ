@@ -1,10 +1,11 @@
 let currentRoom = null;
 let currentPlayerId = null;
-let roomSocket = null;
+let roomConnection = null;
 let timerInterval = null;
 let activeTimerExpiresAt = null;
-let isGeneratingQuestion = false;
+let difficultyRequest = null;
 let isAnsweringQuestion = false;
+let pendingRegenerationQuestionId = null;
 
 function isHost() {
   return currentRoom && currentRoom.host_id === currentPlayerId;
@@ -14,14 +15,31 @@ function isCurrentPlayer() {
   return currentRoom && currentRoom.current_player?.id === currentPlayerId;
 }
 
-function saveSession(roomCode, playerId) {
+function isQuestionRegenerating(question) {
+  return question?.regenerating === true || question?.id === pendingRegenerationQuestionId;
+}
+
+function canAnswerQuestion(room) {
+  return (
+    roomConnection?.ready &&
+    room?.status === "playing" &&
+    room.current_question &&
+    isCurrentPlayer() &&
+    !isAnsweringQuestion &&
+    !isQuestionRegenerating(room.current_question)
+  );
+}
+
+function saveSession(roomCode, playerId, sessionToken) {
   localStorage.setItem("quizez_room_code", roomCode);
   localStorage.setItem("quizez_player_id", playerId);
+  localStorage.setItem("quizez_session_token", sessionToken);
 }
 
 function clearSession() {
   localStorage.removeItem("quizez_room_code");
   localStorage.removeItem("quizez_player_id");
+  localStorage.removeItem("quizez_session_token");
 }
 
 async function getErrorMessage(response, fallbackMessage) {
@@ -57,12 +75,15 @@ function setAlternativeButtonsDisabled(disabled) {
 const hostNameInput = document.getElementById("hostNameInput");
 const createRoomButton = document.getElementById("createRoomButton");
 const roomCodeElement = document.getElementById("roomCode");
+const playersHeading = document.getElementById("playersHeading");
 const playersList = document.getElementById("playersList");
 const playerNameInput = document.getElementById("playerNameInput");
 const joinRoomCodeInput = document.getElementById("joinRoomCodeInput");
 const joinRoomButton = document.getElementById("joinRoomButton");
 const startGameButton = document.getElementById("startGameButton");
 const roomStatus = document.getElementById("roomStatus");
+const roomConnectionNotice = document.getElementById("roomConnectionNotice");
+const cancelRoomReconnectButton = document.getElementById("cancelRoomReconnectButton");
 const currentPlayer = document.getElementById("currentPlayer");
 const themesList = document.getElementById("themesList");
 const selectedTheme = document.getElementById("selectedTheme");
@@ -78,12 +99,18 @@ const leaveRoomButton = document.getElementById("leaveRoomButton");
 const winnerText = document.getElementById("winnerText");
 const restartGameButton = document.getElementById("restartGameButton");
 const copyRoomCodeButton = document.getElementById("copyRoomCodeButton");
+const copyRoomLinkButton = document.getElementById("copyRoomLinkButton");
+const roomInviteFallback = document.getElementById("roomInviteFallback");
+const roomInviteLink = document.getElementById("roomInviteLink");
 const timerText = document.getElementById("timerText");
 const questionModal = document.getElementById("questionModal");
 const modalQuestionMeta = document.getElementById("modalQuestionMeta");
 const modalTimerText = document.getElementById("modalTimerText");
 const modalQuestionText = document.getElementById("modalQuestionText");
 const modalAlternativesList = document.getElementById("modalAlternativesList");
+const regenerateQuestionButton = document.getElementById("regenerateQuestionButton");
+const regenerateQuestionStatus = document.getElementById("regenerateQuestionStatus");
+const removeCurrentPlayerButton = document.getElementById("removeCurrentPlayerButton");
 const modalCurrentPlayer = document.getElementById("modalCurrentPlayer");
 const questionLoadingText = document.getElementById("questionLoadingText");
 const roomSettings = document.getElementById("roomSettings");
@@ -94,26 +121,110 @@ const questionTimeLimitInput = document.getElementById(
 );
 const roomRules = document.getElementById("roomRules");
 
+function renderPlayers(room) {
+  const playing = room.status === "playing";
+  const finished = room.status === "finished";
+  const ranked = playing || finished;
+  const players = ranked ? [...room.players].sort((a, b) => b.score - a.score) : room.players;
+
+  playersHeading.textContent = finished ? "Classificação final" : playing ? "Placar" : "Jogadores";
+  playersList.classList.toggle("is-ranked", ranked);
+  playersList.replaceChildren();
+
+  let rank = 0;
+  for (const [index, player] of players.entries()) {
+    const item = document.createElement("li");
+    item.className = "player-entry";
+
+    const playerName = document.createElement("span");
+    playerName.className = "ranking-name";
+    playerName.textContent = player.is_host ? `${player.name} (host)` : player.name;
+
+    if (player.connection_status !== "online") {
+      const connectionLabel = document.createElement("span");
+      connectionLabel.className = "player-connection-label";
+      connectionLabel.textContent = player.connection_status === "reconnecting" ? "Reconectando" : "Offline";
+      playerName.append(" ", connectionLabel);
+    }
+
+    const score = document.createElement("span");
+    score.className = "ranking-score";
+    score.textContent = `${player.score} ${player.score === 1 ? "ponto" : "pontos"}`;
+
+    const actions = document.createElement("span");
+    actions.className = "player-entry-actions";
+    actions.append(score);
+
+    if (isHost() && player.id !== currentPlayerId) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "remove-player-button";
+      button.textContent = "Remover";
+      button.setAttribute("aria-label", `Remover ${player.name} da sala`);
+      button.disabled = !roomConnection.ready;
+      button.addEventListener("click", () => removePlayer(player, button));
+      actions.append(button);
+    }
+
+    if (ranked) {
+      if (index === 0 || player.score !== players[index - 1].score) {
+        rank = index + 1;
+      }
+
+      const position = document.createElement("span");
+      position.className = "ranking-position";
+      position.textContent = `${rank}º`;
+
+      const onTurn = playing && player.id === room.current_player?.id;
+      const winner = finished && player.id === room.winner?.id;
+      item.classList.add("ranking-row");
+
+      if (onTurn || winner) {
+        const label = document.createElement("span");
+        label.className = "ranking-label";
+        label.textContent = winner ? "Vencedor" : "Na vez";
+        playerName.append(" ", label);
+        item.classList.add("ranking-highlight");
+      }
+
+      item.append(position);
+    }
+
+    item.append(playerName, actions);
+    playersList.append(item);
+  }
+}
+
 function renderRoom(room) {
+  if (
+    roomConnection?.roomCode !== room.code ||
+    !room.players.some((player) => player.id === currentPlayerId) ||
+    (currentRoom?.code === room.code && room.turn_number < currentRoom.turn_number)
+  ) {
+    return;
+  }
+
+  if (difficultyRequest && (
+    difficultyRequest.connection !== roomConnection ||
+    difficultyRequest.turnNumber !== room.turn_number
+  )) {
+    difficultyRequest = null;
+    setQuestionLoading(false);
+  }
+
+  const connected = roomConnection.ready;
   currentRoom = room;
   createRoomSection.style.display = "none";
   joinRoomSection.style.display = "none";
   roomSection.style.display = "block";
+  cancelRoomReconnectButton.hidden = true;
+  startGameButton.disabled = !connected;
+  restartGameButton.disabled = !connected;
+  saveSettingsButton.disabled = !connected;
 
   roomCodeElement.textContent = room.code;
 
-  playersList.innerHTML = "";
-
-  for (const player of room.players) {
-    const item = document.createElement("li");
-    item.textContent = `${player.name} - ${player.score} pontos`;
-
-    if (player.is_host) {
-      item.textContent += " (host)";
-    }
-
-    playersList.appendChild(item);
-  }
+  renderPlayers(room);
 
   roomStatus.textContent = room.status;
 
@@ -133,7 +244,7 @@ function renderRoom(room) {
   themesList.innerHTML = "";
 
   const canChooseTheme =
-    room.status === "playing" && isCurrentPlayer() && !room.selected_theme;
+    connected && room.status === "playing" && isCurrentPlayer() && !room.selected_theme;
 
   for (const theme of room.available_themes || []) {
     const item = document.createElement("li");
@@ -149,11 +260,12 @@ function renderRoom(room) {
   selectedTheme.textContent = room.selected_theme || "-";
 
   const canChooseDifficulty =
+    connected &&
     room.status === "playing" &&
     isCurrentPlayer() &&
     room.selected_theme &&
     !room.current_question &&
-    !isGeneratingQuestion;
+    !difficultyRequest;
 
   if (canChooseDifficulty) {
     difficultyButtons.style.display = "block";
@@ -161,18 +273,19 @@ function renderRoom(room) {
     difficultyButtons.style.display = "none";
   }
 
-  if (room.current_question) {
-    questionText.textContent = room.current_question.question;
+  const question = room.current_question;
+  if (question) {
+    questionText.textContent = question.question;
 
     alternativesList.innerHTML = "";
 
-    for (const alternative of room.current_question.alternatives) {
+    for (const alternative of question.alternatives) {
       const item = document.createElement("li");
       const button = document.createElement("button");
 
       button.textContent = alternative;
-      button.disabled = room.status !== "playing" || !isCurrentPlayer();
-      button.addEventListener("click", () => answerQuestion(alternative));
+      button.disabled = !canAnswerQuestion(room);
+      button.addEventListener("click", () => answerQuestion(alternative, question.id));
 
       item.appendChild(button);
       alternativesList.appendChild(item);
@@ -181,8 +294,14 @@ function renderRoom(room) {
     questionText.textContent = "-";
     alternativesList.innerHTML = "";
   }
-  if (room.current_question?.expires_at && room.status === "playing") {
-    startTimerDisplay(room.current_question.expires_at);
+  if (!connected) {
+    stopTimerDisplay();
+  } else if (isQuestionRegenerating(question)) {
+    stopTimerDisplay();
+    timerText.textContent = "Pausado";
+    modalTimerText.textContent = "Pausado";
+  } else if (question?.expires_at && room.status === "playing") {
+    startTimerDisplay(question.expires_at);
   } else {
     stopTimerDisplay();
   }
@@ -263,8 +382,8 @@ async function createRoom() {
   const data = await response.json();
 
   currentPlayerId = data.player_id;
-  connectWebSocket(data.room.code);
-  saveSession(data.room.code, currentPlayerId);
+  connectWebSocket(data.room.code, data.session_token);
+  saveSession(data.room.code, currentPlayerId, data.session_token);
   renderRoom(data.room);
 }
 
@@ -305,8 +424,8 @@ async function joinRoom() {
   const data = await response.json();
 
   currentPlayerId = data.player_id;
-  connectWebSocket(data.room.code);
-  saveSession(data.room.code, currentPlayerId);
+  connectWebSocket(data.room.code, data.session_token);
+  saveSession(data.room.code, currentPlayerId, data.session_token);
   renderRoom(data.room);
 }
 
@@ -372,19 +491,16 @@ async function selectTheme(theme) {
 }
 
 async function selectDifficulty(difficulty) {
-  if (!currentRoom || !currentPlayerId) {
-    alert("Crie ou entre em uma sala primeiro.");
+  if (!roomConnection?.ready || !isCurrentPlayer() || difficultyRequest) {
     return;
   }
 
-  if (isGeneratingQuestion) {
-    return;
-  }
-
+  const request = { connection: roomConnection, turnNumber: currentRoom.turn_number };
+  difficultyRequest = request;
   setQuestionLoading(true);
 
   try {
-    const response = await fetch(`/rooms/${currentRoom.code}/difficulty`, {
+    const response = await fetch(`/rooms/${request.connection.roomCode}/difficulty`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -395,20 +511,38 @@ async function selectDifficulty(difficulty) {
       }),
     });
 
+    if (difficultyRequest !== request) {
+      return;
+    }
+
     if (!response.ok) {
       const message = await getErrorMessage(
         response,
         "Não foi possível escolher essa dificuldade.",
       );
 
-      alert(message);
+      if (difficultyRequest === request) {
+        alert(message);
+      }
       return;
     }
 
     const room = await response.json();
-    renderRoom(room);
+    if (difficultyRequest === request) {
+      renderRoom(room);
+    }
+  } catch {
+    if (difficultyRequest === request && request.connection.ready) {
+      alert("Não foi possível gerar a pergunta.");
+    }
   } finally {
-    setQuestionLoading(false);
+    if (difficultyRequest === request) {
+      difficultyRequest = null;
+      setQuestionLoading(false);
+      if (currentRoom) {
+        renderRoom(currentRoom);
+      }
+    }
   }
 }
 
@@ -418,21 +552,18 @@ for (const button of difficultyButtons.querySelectorAll("button")) {
   });
 }
 
-async function answerQuestion(answer) {
-  if (!currentRoom || !currentPlayerId) {
-    alert("Crie ou entre em uma sala primeiro.");
+async function answerQuestion(answer, questionId) {
+  if (!canAnswerQuestion(currentRoom) || currentRoom.current_question.id !== questionId) {
     return;
   }
 
-  if (isAnsweringQuestion) {
-    return;
-  }
-
+  const roomCode = currentRoom.code;
   isAnsweringQuestion = true;
   setAlternativeButtonsDisabled(true);
+  regenerateQuestionButton.disabled = true;
 
   try {
-    const response = await fetch(`/rooms/${currentRoom.code}/answer`, {
+    const response = await fetch(`/rooms/${roomCode}/answer`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -440,6 +571,7 @@ async function answerQuestion(answer) {
       body: JSON.stringify({
         player_id: currentPlayerId,
         answer: answer,
+        question_id: questionId,
       }),
     });
 
@@ -454,38 +586,177 @@ async function answerQuestion(answer) {
     }
 
     const room = await response.json();
-    renderRoom(room);
+    if (currentRoom?.code === roomCode && currentRoom.current_question?.id === questionId) {
+      renderRoom(room);
+    }
   } finally {
     isAnsweringQuestion = false;
-    setAlternativeButtonsDisabled(false);
+    setAlternativeButtonsDisabled(!canAnswerQuestion(currentRoom));
+    regenerateQuestionButton.disabled = isQuestionRegenerating(currentRoom?.current_question);
   }
 }
 
-function connectWebSocket(roomCode) {
-  if (roomSocket) {
-    roomSocket.close();
+async function regenerateQuestion() {
+  const room = currentRoom;
+  const question = room?.current_question;
+  if (
+    !roomConnection?.ready ||
+    !question ||
+    room.status !== "playing" ||
+    !isCurrentPlayer() ||
+    question.regenerated ||
+    isQuestionRegenerating(question) ||
+    isAnsweringQuestion
+  ) {
+    return;
   }
 
+  pendingRegenerationQuestionId = question.id;
+  renderRoom(room);
+
+  try {
+    const response = await fetch(`/rooms/${room.code}/regenerate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ player_id: currentPlayerId, question_id: question.id }),
+    });
+
+    if (!response.ok) {
+      alert(await getErrorMessage(response, "Não foi possível trocar a pergunta."));
+      return;
+    }
+
+    const updatedRoom = await response.json();
+    if (currentRoom?.code === room.code && currentRoom.current_question?.id === question.id) {
+      renderRoom(updatedRoom);
+    }
+  } catch {
+    alert("Não foi possível confirmar a troca da pergunta.");
+  } finally {
+    if (pendingRegenerationQuestionId === question.id) {
+      pendingRegenerationQuestionId = null;
+    }
+    if (currentRoom?.code === room.code) {
+      renderRoom(currentRoom);
+    }
+  }
+}
+
+function setRoomConnectionNotice(message) {
+  roomConnectionNotice.textContent = message;
+  roomConnectionNotice.hidden = !message;
+  cancelRoomReconnectButton.hidden = !message || !roomConnection || Boolean(currentRoom);
+}
+
+function closeRoomConnection() {
+  const connection = roomConnection;
+  roomConnection = null;
+  if (connection) {
+    clearTimeout(connection.retryTimer);
+    connection.socket?.close();
+  }
+}
+
+function openRoomSocket(connection) {
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  roomSocket = new WebSocket(
-    `${protocol}://${window.location.host}/ws/${roomCode}`,
+  const socket = new WebSocket(
+    `${protocol}://${window.location.host}/ws/${encodeURIComponent(connection.roomCode)}`,
   );
+  connection.socket = socket;
 
-  roomSocket.addEventListener("open", () => {
-    console.log("WebSocket conectado.");
-  });
+  const syncTimer = setTimeout(() => {
+    if (connection.socket === socket) {
+      scheduleRoomReconnect(connection);
+    }
+  }, 10000);
 
-  roomSocket.addEventListener("close", () => {
-    console.log("WebSocket desconectado.");
-  });
-
-  roomSocket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
-
-    if (message.type === "room_updated") {
-      renderRoom(message.room);
+  socket.addEventListener("open", () => {
+    if (roomConnection === connection && connection.socket === socket) {
+      socket.send(JSON.stringify({
+        player_id: connection.playerId,
+        session_token: connection.sessionToken,
+      }));
     }
   });
+
+  socket.addEventListener("close", (event) => {
+    clearTimeout(syncTimer);
+    if (roomConnection !== connection || connection.socket !== socket) {
+      return;
+    }
+
+    if (event.code === 4404) {
+      returnToLobby("A sala foi encerrada ou o servidor reiniciou.");
+    } else if (event.code === 4403) {
+      returnToLobby("Você não faz mais parte desta sala.");
+    } else {
+      scheduleRoomReconnect(connection);
+    }
+  });
+
+  socket.addEventListener("message", (event) => {
+    if (roomConnection !== connection || connection.socket !== socket) {
+      return;
+    }
+
+    const message = JSON.parse(event.data);
+    if (message.type === "room_closed") {
+      returnToLobby("A sala foi encerrada.");
+      return;
+    }
+    if (message.type !== "room_updated") {
+      return;
+    }
+
+    if (!message.room.players.some((player) => player.id === connection.playerId)) {
+      returnToLobby("Você não faz mais parte desta sala.");
+      return;
+    }
+
+    clearTimeout(syncTimer);
+    connection.ready = true;
+    connection.retryDelay = 1000;
+    setRoomConnectionNotice("");
+    renderRoom(message.room);
+  });
+}
+
+function scheduleRoomReconnect(connection) {
+  if (roomConnection !== connection || connection.retryTimer !== null) {
+    return;
+  }
+
+  const socket = connection.socket;
+  connection.socket = null;
+  connection.ready = false;
+  socket?.close();
+  setRoomConnectionNotice("Reconectando…");
+  if (currentRoom) {
+    renderRoom(currentRoom);
+  }
+
+  connection.retryTimer = setTimeout(() => {
+    connection.retryTimer = null;
+    if (roomConnection === connection) {
+      openRoomSocket(connection);
+    }
+  }, connection.retryDelay);
+  connection.retryDelay = Math.min(connection.retryDelay * 2, 10000);
+}
+
+function connectWebSocket(roomCode, sessionToken) {
+  closeRoomConnection();
+  roomConnection = {
+    roomCode,
+    playerId: currentPlayerId,
+    sessionToken,
+    socket: null,
+    ready: false,
+    retryTimer: null,
+    retryDelay: 1000,
+  };
+  setRoomConnectionNotice("Conectando à sala…");
+  openRoomSocket(roomConnection);
 }
 
 function getGameMessage(room) {
@@ -510,7 +781,11 @@ function getGameMessage(room) {
   }
 
   if (!room.current_player) {
-    return "Aguardando jogador da vez.";
+    return "Aguardando um jogador se conectar.";
+  }
+
+  if (room.current_player.connection_status === "reconnecting") {
+    return `${room.current_player.name} está reconectando.`;
   }
 
   if (!room.selected_theme) {
@@ -537,51 +812,84 @@ function getGameMessage(room) {
 }
 
 async function leaveRoom() {
-  const roomCode = currentRoom?.code;
-  const playerId = currentPlayerId;
+  const connection = roomConnection;
+  if (!connection) {
+    return;
+  }
 
-  if (roomCode && playerId) {
+  returnToLobby();
+  try {
+    const { roomCode, playerId, sessionToken } = connection;
     const response = await fetch(`/rooms/${roomCode}/leave`, {
       method: "POST",
+      keepalive: true,
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
         player_id: playerId,
+        session_token: sessionToken,
       }),
     });
 
     if (!response.ok) {
-      const message = await getErrorMessage(
-        response,
-        "Não foi possível sair da sala.",
-      );
-
-      alert(message);
-      return;
+      throw new Error("Falha ao avisar o servidor.");
+    }
+  } catch {
+    if (!roomConnection) {
+      setRoomConnectionNotice("Você saiu. O servidor não recebeu a saída.");
     }
   }
+}
 
-  if (roomCode && playerId) {
-    await fetch(`/rooms/${roomCode}/leave`, {
+async function removePlayer(player, button) {
+  const connection = roomConnection;
+  if (!connection?.ready || !isHost() || player.id === currentPlayerId) {
+    return;
+  }
+  if (!window.confirm(`Remover ${player.name} da sala?`)) {
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    const response = await fetch(`/rooms/${connection.roomCode}/kick`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        player_id: playerId,
+        player_id: connection.playerId,
+        session_token: connection.sessionToken,
+        target_player_id: player.id,
       }),
     });
-  }
 
-  if (roomSocket) {
-    roomSocket.close();
-    roomSocket = null;
-  }
+    if (!response.ok) {
+      alert(await getErrorMessage(response, "Não foi possível remover o jogador."));
+      return;
+    }
 
+    const room = await response.json();
+    if (roomConnection === connection) {
+      renderRoom(room);
+    }
+  } catch {
+    alert("Não foi possível remover o jogador.");
+  } finally {
+    button.disabled = !connection.ready;
+  }
+}
+
+function returnToLobby(message = "") {
+  closeRoomConnection();
   currentRoom = null;
   currentPlayerId = null;
   clearSession();
+  difficultyRequest = null;
+  setQuestionLoading(false);
+  setRoomConnectionNotice(message);
+  roomInviteFallback.hidden = true;
+  questionModal.classList.remove("is-open");
+  stopTimerDisplay();
 
   roomCodeElement.textContent = "-";
   playersList.innerHTML = "";
@@ -629,35 +937,21 @@ async function restartGame() {
   renderRoom(room);
 }
 
-async function restoreSession() {
+function restoreSession() {
   const roomCode = localStorage.getItem("quizez_room_code");
   const playerId = localStorage.getItem("quizez_player_id");
+  const sessionToken = localStorage.getItem("quizez_session_token");
 
   if (!roomCode || !playerId) {
     return;
   }
-
-  const response = await fetch(`/rooms/${roomCode}`);
-
-  if (!response.ok) {
-    clearSession();
-    return;
-  }
-
-  const room = await response.json();
-
-  const playerStillExists = room.players.some(
-    (player) => player.id === playerId,
-  );
-
-  if (!playerStillExists) {
-    clearSession();
+  if (!sessionToken) {
+    returnToLobby("A sessão anterior expirou. Entre na sala novamente.");
     return;
   }
 
   currentPlayerId = playerId;
-  renderRoom(room);
-  connectWebSocket(room.code);
+  connectWebSocket(roomCode.toUpperCase(), sessionToken);
 }
 
 async function copyRoomCode() {
@@ -672,6 +966,55 @@ async function copyRoomCode() {
   setTimeout(() => {
     copyRoomCodeButton.textContent = "Copiar código";
   }, 1500);
+}
+
+async function copyRoomLink() {
+  const roomCode = currentRoom?.code;
+
+  if (!roomCode) {
+    return;
+  }
+
+  const inviteUrl = new URL(window.location.href);
+  inviteUrl.search = "";
+  inviteUrl.hash = "";
+  inviteUrl.searchParams.set("room", roomCode);
+  const link = inviteUrl.href;
+
+  try {
+    await navigator.clipboard.writeText(link);
+  } catch {
+    if (currentRoom?.code === roomCode) {
+      roomInviteLink.value = link;
+      roomInviteFallback.hidden = false;
+      roomInviteLink.focus();
+      roomInviteLink.select();
+    }
+    return;
+  }
+
+  if (currentRoom?.code !== roomCode) {
+    return;
+  }
+
+  roomInviteFallback.hidden = true;
+  copyRoomLinkButton.textContent = "Link copiado!";
+
+  setTimeout(() => {
+    copyRoomLinkButton.textContent = "Copiar link da sala";
+  }, 1500);
+}
+
+function loadRoomInvite() {
+  const params = new URLSearchParams(window.location.search);
+  const roomCode = params.get("room")?.trim().toUpperCase();
+
+  if (!/^[0-9A-F]{6}$/.test(roomCode)) {
+    return;
+  }
+
+  joinRoomCodeInput.value = roomCode;
+  playerNameInput.focus();
 }
 
 function stopTimerDisplay() {
@@ -715,31 +1058,48 @@ function startTimerDisplay(expiresAt) {
 }
 
 function renderQuestionModal(room) {
-  if (!room.current_question || room.status !== "playing") {
+  const question = room.current_question;
+  if (!roomConnection?.ready || !question || room.status !== "playing") {
     questionModal.classList.remove("is-open");
     modalCurrentPlayer.textContent = "-";
     modalQuestionText.textContent = "-";
     modalAlternativesList.innerHTML = "";
+    regenerateQuestionButton.hidden = true;
+    regenerateQuestionStatus.hidden = true;
+    removeCurrentPlayerButton.hidden = true;
     return;
   }
 
   questionModal.classList.add("is-open");
 
-  modalQuestionMeta.textContent = `${room.selected_theme} | ${room.selected_difficulty}`;
+  const pointsLabel = question.points === 1 ? "1 ponto" : `${question.points} pontos`;
+  modalQuestionMeta.textContent = `${room.selected_theme} | ${room.selected_difficulty} | Vale ${pointsLabel}`;
   modalCurrentPlayer.textContent = room.current_player
     ? `Respondendo: ${room.current_player.name}`
     : "Respondendo: -";
-  modalQuestionText.textContent = room.current_question.question;
+  if (room.current_player?.connection_status === "reconnecting") {
+    modalCurrentPlayer.textContent += " (reconectando)";
+  }
+  removeCurrentPlayerButton.hidden = !isHost() || !room.current_player || isCurrentPlayer();
+  modalQuestionText.textContent = question.question;
+
+  const regenerating = isQuestionRegenerating(question);
+  regenerateQuestionButton.hidden = !isCurrentPlayer() || question.regenerated;
+  regenerateQuestionButton.disabled = regenerating || isAnsweringQuestion;
+  regenerateQuestionButton.textContent = question.points > 1
+    ? "Trocar pergunta (-1 ponto)"
+    : "Trocar pergunta";
+  regenerateQuestionStatus.hidden = !regenerating;
 
   modalAlternativesList.innerHTML = "";
 
-  for (const alternative of room.current_question.alternatives) {
+  for (const alternative of question.alternatives) {
     const item = document.createElement("li");
     const button = document.createElement("button");
 
     button.textContent = alternative;
-    button.disabled = room.status !== "playing" || !isCurrentPlayer();
-    button.addEventListener("click", () => answerQuestion(alternative));
+    button.disabled = !canAnswerQuestion(room);
+    button.addEventListener("click", () => answerQuestion(alternative, question.id));
 
     item.appendChild(button);
     modalAlternativesList.appendChild(item);
@@ -747,7 +1107,6 @@ function renderQuestionModal(room) {
 }
 
 function setQuestionLoading(isLoading) {
-  isGeneratingQuestion = isLoading;
   setDifficultyButtonsDisabled(isLoading);
   questionLoadingText.style.display = isLoading ? "block" : "none";
 }
@@ -806,8 +1165,29 @@ createRoomButton.addEventListener("click", createRoom);
 joinRoomButton.addEventListener("click", joinRoom);
 startGameButton.addEventListener("click", startGame);
 leaveRoomButton.addEventListener("click", leaveRoom);
+cancelRoomReconnectButton.addEventListener("click", leaveRoom);
 restartGameButton.addEventListener("click", restartGame);
-restoreSession();
 copyRoomCodeButton.addEventListener("click", copyRoomCode);
+copyRoomLinkButton.addEventListener("click", copyRoomLink);
+regenerateQuestionButton.addEventListener("click", regenerateQuestion);
+removeCurrentPlayerButton.addEventListener("click", () => {
+  if (currentRoom?.current_player) {
+    removePlayer(currentRoom.current_player, removeCurrentPlayerButton);
+  }
+});
 saveSettingsButton.addEventListener("click", saveRoomSettings);
-// teste2//
+window.addEventListener("offline", () => {
+  if (roomConnection) {
+    scheduleRoomReconnect(roomConnection);
+  }
+});
+window.addEventListener("online", () => {
+  const connection = roomConnection;
+  if (connection && connection.retryTimer !== null) {
+    clearTimeout(connection.retryTimer);
+    connection.retryTimer = null;
+    openRoomSocket(connection);
+  }
+});
+loadRoomInvite();
+restoreSession();

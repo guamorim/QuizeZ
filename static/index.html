@@ -8,6 +8,8 @@
   <body>
     <main>
       <h1>quizeZ</h1>
+      <p id="roomConnectionNotice" role="status" hidden></p>
+      <button id="cancelRoomReconnectButton" type="button" hidden>Sair da sala</button>
 
       <section id="createRoomSection">
         <h2>Criar sala</h2>
@@ -32,7 +34,12 @@
 
         <p>Código: <strong id="roomCode">-</strong></p>
         <button id="copyRoomCodeButton">Copiar código</button>
+        <button id="copyRoomLinkButton" type="button">Copiar link da sala</button>
         <button id="leaveRoomButton">Sair da sala</button>
+        <div id="roomInviteFallback" hidden>
+          <label for="roomInviteLink">Link da sala</label>
+          <input id="roomInviteLink" type="text" readonly />
+        </div>
 
         <h3>Regras da sala</h3>
         <p id="roomRules">-</p>
@@ -67,8 +74,8 @@
           <button id="saveSettingsButton">Salvar configurações</button>
         </div>
 
-        <h3>Jogadores</h3>
-        <ul id="playersList"></ul>
+        <h3 id="playersHeading">Jogadores</h3>
+        <ul id="playersList" role="list" aria-labelledby="playersHeading"></ul>
         <button id="startGameButton">Iniciar partida</button>
 
         <h3>Status</h3>
@@ -127,6 +134,9 @@
           <p id="modalQuestionText">-</p>
 
           <ul id="modalAlternativesList"></ul>
+          <button id="regenerateQuestionButton" type="button" hidden>Trocar pergunta</button>
+          <p id="regenerateQuestionStatus" role="status" hidden>Gerando nova pergunta...</p>
+          <button id="removeCurrentPlayerButton" class="remove-player-button" type="button" hidden>Remover jogador da vez</button>
         </div>
       </div>
     </main>

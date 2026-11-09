@@ -79,11 +79,12 @@ Nivel dificil:
     return "Nivel nao especificado."
 
 
-def generate_fake_question(theme, difficulty):
+def generate_fake_question(theme, difficulty, *, replacement=False):
+    label = "Pergunta alternativa de exemplo" if replacement else "Pergunta de exemplo"
     question = {
         "theme": theme,
         "difficulty": difficulty,
-        "question": f"Pergunta de exemplo sobre {theme} na dificuldade {difficulty}.",
+        "question": f"{label} sobre {theme} na dificuldade {difficulty}.",
         "alternatives": [
             "Alternativa A",
             "Alternativa B",
@@ -175,7 +176,7 @@ Formato exato:
     return shuffle_question_alternatives(question)
 
 
-def generate_question(theme, difficulty, asked_questions=None):
+def generate_question(theme, difficulty, asked_questions=None, *, different_from=None):
     asked_questions = asked_questions or []
     provider = os.getenv("QUESTION_PROVIDER", "fake")
 
@@ -184,12 +185,19 @@ def generate_question(theme, difficulty, asked_questions=None):
 
         for attempt in range(3):
             try:
-                return generate_ollama_question(theme, difficulty, asked_questions)
+                question = generate_ollama_question(theme, difficulty, asked_questions)
+                if different_from is not None and (
+                    question["question"].strip().casefold() == different_from.strip().casefold()
+                ):
+                    raise ValueError("O Ollama repetiu a pergunta atual")
+                return question
             except Exception as error:
                 last_error = error
                 print(f"Tentativa {attempt + 1} falhou ao gerar pergunta com Ollama: {error}")
 
-        print(f"Todas as tentativas com Ollama falharam. Usando pergunta fake. Ultimo erro: {last_error}")
-        return generate_fake_question(theme, difficulty)
+        if different_from is not None:
+            raise RuntimeError("Nao foi possivel gerar outra pergunta") from last_error
 
-    return generate_fake_question(theme, difficulty)
+        print(f"Todas as tentativas com Ollama falharam. Usando pergunta fake. Ultimo erro: {last_error}")
+
+    return generate_fake_question(theme, difficulty, replacement=different_from is not None)

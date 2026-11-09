@@ -2,7 +2,7 @@
 
 Quiz multiplayer em português para jogar com amigos pelo navegador. O host cria uma sala, compartilha o código ou o link de convite e inicia a partida. Cada jogador entra só com um nome.
 
-O servidor usa Python e FastAPI. A interface é feita em HTML, CSS e JavaScript, e as atualizações da sala chegam por WebSocket. As perguntas podem ser geradas pelo Ollama local ou vir de um modo de demonstração.
+O servidor usa Python e FastAPI. A interface Arcade usa React, Vite e CSS, e as atualizações da sala chegam por WebSocket. As perguntas podem ser geradas pelo Ollama local ou vir de um modo de demonstração.
 
 ## Como jogar
 
@@ -33,7 +33,7 @@ O tempo padrão é de **30 segundos** (ajustável de 5 a 180) e a meta padrão �
 
 ## Rodar localmente
 
-Use **Python 3.11 ou superior** e um navegador. O Ollama é opcional e só é necessário para gerar perguntas por IA.
+Use **Python 3.11 ou superior**, **Node.js 22.12 ou superior** para compilar o Arcade e um navegador. O Ollama é opcional e só é necessário para gerar perguntas por IA.
 
 Na raiz do projeto, crie o ambiente virtual e instale as dependências.
 
@@ -70,6 +70,26 @@ OLLAMA_MODEL=llama3.1:8b
 
 O backend chama o Ollama em `http://localhost:11434/api/generate`. Ele valida a estrutura da pergunta, embaralha as alternativas e usa as últimas dez perguntas como contexto para reduzir repetições. Se o Ollama falhar ao gerar uma pergunta inicial, o jogo pode usar uma pergunta de exemplo. Para voltar ao modo de demonstração, use `QUESTION_PROVIDER=fake` e reinicie o servidor.
 
+### Compilar o Arcade
+
+Na raiz do projeto, instale as dependências do frontend e gere os arquivos que o FastAPI vai servir.
+
+**Windows (PowerShell)**
+
+```powershell
+npm.cmd --prefix frontend ci
+npm.cmd --prefix frontend run build
+```
+
+**Linux e macOS**
+
+```bash
+npm --prefix frontend ci
+npm --prefix frontend run build
+```
+
+O build fica em `static/react/`. Execute o build novamente após alterar o código React.
+
 ### Iniciar o servidor
 
 **Windows (PowerShell)**
@@ -84,7 +104,9 @@ O backend chama o Ollama em `http://localhost:11434/api/generate`. Ele valida a 
 ./.venv/bin/python -m uvicorn app.main:app --reload
 ```
 
-Abra [o jogo](http://127.0.0.1:8000/static/index.html) no navegador. A [documentação da API](http://127.0.0.1:8000/docs) também fica disponível enquanto o servidor estiver ligado. Use `Ctrl+C` para parar.
+Abra o [Arcade](http://127.0.0.1:8000/) no navegador. Os convites abrem esse endereço com o código da sala preenchido. Convites antigos que usam `/static/index.html` redirecionam para o Arcade. Se o build estiver ausente, a página mostra os comandos de compilação.
+
+A [documentação da API](http://127.0.0.1:8000/docs) e o [status do servidor](http://127.0.0.1:8000/health) têm endereços próprios. Use `Ctrl+C` para parar.
 
 ## Estrutura do projeto
 
@@ -93,9 +115,8 @@ Abra [o jogo](http://127.0.0.1:8000/static/index.html) no navegador. A [document
 | [`app/main.py`](app/main.py) | Rotas HTTP, arquivos estáticos, WebSocket e timers do servidor |
 | [`app/game_functions.py`](app/game_functions.py) | Estado das salas, ordem dos turnos, regras e pontuação |
 | [`app/ai_questions.py`](app/ai_questions.py) | Geração, validação e embaralhamento de perguntas |
-| [`static/index.html`](static/index.html) | Lobby, sala e popup de perguntas |
-| [`static/app.js`](static/app.js) | Interface, convites, sessão local e reconexão |
-| [`static/style.css`](static/style.css) | Estilos da interface e do placar |
+| [`frontend/src/`](frontend/src/) | Lobby Arcade, turnos, popup, placar e sessão React |
+| [`frontend/vite.config.js`](frontend/vite.config.js) | Build do Arcade e proxy de desenvolvimento para o FastAPI |
 | [`requirements.txt`](requirements.txt) | FastAPI, Uvicorn com suporte a WebSocket, python-dotenv e Requests |
 
 O navegador envia ações por HTTP e recebe o estado da sala pelo WebSocket em `/ws/{room_code}`. Ao reconectar, a sessão identifica o mesmo jogador e o servidor envia o estado atual. As salas ficam na memória de **um processo** do servidor. Reiniciar o processo encerra as partidas abertas.

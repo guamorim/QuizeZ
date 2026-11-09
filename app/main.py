@@ -1,9 +1,12 @@
 import json
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlencode
 
 from app.ai_questions import generate_question
 from app.game_functions import (
@@ -26,6 +29,7 @@ from app.game_functions import (
 )
 
 app = FastAPI()
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 websocket_connections = {}
 QUESTION_TIME_LIMIT = 30
 DISCONNECT_GRACE_PERIOD = 10
@@ -126,7 +130,16 @@ async def remove_player_from_room(room_code, player_id):
     await broadcast_room(room_code)
     return room
         
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Old invite links must be matched before the static file mount.
+@app.get("/static/index.html", include_in_schema=False)
+def redirect_legacy_invite(room: str | None = None):
+    destination = "/"
+    if room:
+        destination += "?" + urlencode({"room": room})
+    return RedirectResponse(destination)
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 class CreateRoomRequest(BaseModel):
@@ -167,8 +180,27 @@ class UpdateRoomSettingsRequest(BaseModel):
     points_to_win: int
     question_time_limit: int
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def home():
+    index = STATIC_DIR / "react" / "index.html"
+    if not index.is_file():
+        return PlainTextResponse(
+            "O Arcade ainda nao foi compilado. Na raiz do projeto, execute:\n\n"
+            "Windows (PowerShell):\n"
+            "npm.cmd --prefix frontend ci\n"
+            "npm.cmd --prefix frontend run build\n\n"
+            "Linux ou macOS:\n"
+            "npm --prefix frontend ci\n"
+            "npm --prefix frontend run build\n\n"
+            "Depois, recarregue a pagina.",
+            status_code=503,
+            headers={"Cache-Control": "no-store"},
+        )
+    return FileResponse(index, headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/health")
+def health():
     return {"message": "Servidor do quizeZ rodando"}
 
 

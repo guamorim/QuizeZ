@@ -1,7 +1,5 @@
-import asyncio
 from random import choice, sample
 from secrets import compare_digest, token_hex
-from app.ai_questions import generate_question
 
 rooms = {}
 THEMES_POOL = [
@@ -72,6 +70,7 @@ def create_room(host_name):
         "available_themes": [],
         "selected_theme": None,
         "selected_difficulty": None,
+        "question_generation_status": None,
         "current_question": None,
         "last_answer_result": None,
         "winner": None,
@@ -135,6 +134,7 @@ def prepare_turn(room, player_index):
     room["available_themes"] = choose_themes() if player_index is not None else []
     room["selected_theme"] = None
     room["selected_difficulty"] = None
+    room["question_generation_status"] = None
     room["current_question"] = None
 
 
@@ -230,10 +230,11 @@ def set_current_question(room, question, *, regenerated=False):
     base_points = POINTS_BY_DIFFICULTY[question["difficulty"]]
     question["points"] = max(1, base_points - 1) if regenerated else base_points
     room["current_question"] = question
+    room["question_generation_status"] = None
     room["asked_questions"].append(question["question"])
 
 
-async def select_difficulty(room_code, player_id, difficulty):
+def select_difficulty(room_code, player_id, difficulty):
 
     room = get_room(room_code)
 
@@ -254,31 +255,17 @@ async def select_difficulty(room_code, player_id, difficulty):
     if room["selected_theme"] is None:
         return None
     
-    if room["selected_difficulty"] is not None:
+    if difficulty not in POINTS_BY_DIFFICULTY:
         return None
 
-    if difficulty not in ["facil", "medio", "dificil"]:
+    previous_difficulty = room["selected_difficulty"]
+    if previous_difficulty is not None and (
+        room["question_generation_status"] != "failed" or difficulty != previous_difficulty
+    ):
         return None
 
-    turn_number = room["turn_number"]
     room["selected_difficulty"] = difficulty
-    question = None
-    try:
-        question = await asyncio.to_thread(
-            generate_question,
-            room["selected_theme"],
-            difficulty,
-            room["asked_questions"].copy(),
-        )
-    finally:
-        if question is None and room["turn_number"] == turn_number:
-            room["selected_difficulty"] = None
-
-    if get_room(room_code) is not room or room["turn_number"] != turn_number:
-        return None
-
-    set_current_question(room, question)
-
+    room["question_generation_status"] = "generating"
     return room
 
 def next_turn(room_code):

@@ -68,7 +68,7 @@ QUESTION_PROVIDER=ollama
 OLLAMA_MODEL=llama3.1:8b
 ```
 
-O backend chama o Ollama em `http://localhost:11434/api/generate`. Ele valida a estrutura da pergunta, embaralha as alternativas e usa as últimas dez perguntas como contexto para reduzir repetições. Se o Ollama falhar ao gerar uma pergunta inicial, o jogo pode usar uma pergunta de exemplo. Para voltar ao modo de demonstração, use `QUESTION_PROVIDER=fake` e reinicie o servidor.
+O backend chama o Ollama em `http://localhost:11434/api/generate`. Ele valida a estrutura da pergunta, embaralha as alternativas e usa as últimas dez perguntas como contexto para reduzir repetições. Se as três tentativas de gerar a pergunta falharem, o jogador da vez pode clicar em **Tentar novamente** sem mudar o tema, a dificuldade ou a pontuação. O timer só começa quando a pergunta fica pronta. Para usar perguntas de exemplo, configure `QUESTION_PROVIDER=fake` e reinicie o servidor.
 
 ### Compilar o Arcade
 
@@ -135,5 +135,5 @@ O endereço `127.0.0.1` funciona apenas no próprio computador. Para jogar de ou
 ## Problemas comuns
 
 - **O navegador não conecta à sala.** Abra o jogo pelo endereço do Uvicorn e confira se as dependências foram instaladas com `requirements.txt`. O pacote `uvicorn[standard]` inclui o suporte a WebSocket.
-- **Só aparecem perguntas de exemplo.** Confira `QUESTION_PROVIDER=ollama`, o nome em `OLLAMA_MODEL` e se o Ollama está rodando. O terminal do servidor mostra as falhas de geração.
+- **Não foi possível gerar a pergunta.** Confira se o Ollama está rodando e se o modelo em `OLLAMA_MODEL` está disponível. O terminal do servidor mostra as falhas de geração. Depois de resolver o problema, clique em **Tentar novamente** no seu turno.
 - **Uma mudança na interface não apareceu.** Recarregue com `Ctrl+F5` para buscar os arquivos estáticos atualizados.

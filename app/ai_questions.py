@@ -9,6 +9,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+class QuestionGenerationError(RuntimeError):
+    pass
+
+
 def extract_json_object(text):
     start = text.find("{")
     end = text.rfind("}")
@@ -27,11 +31,19 @@ def validate_question_data(data):
         if key not in data:
             raise ValueError(f"Campo ausente na pergunta: {key}")
 
+    if not isinstance(data["question"], str) or not data["question"].strip():
+        raise ValueError("O texto da pergunta nao pode estar vazio")
+
     if not isinstance(data["alternatives"], list):
         raise ValueError("Alternativas precisam ser uma lista")
 
     if len(data["alternatives"]) != 4:
         raise ValueError("A pergunta precisa ter exatamente 4 alternativas")
+
+    if any(not isinstance(answer, str) or not answer.strip() for answer in data["alternatives"]):
+        raise ValueError("As alternativas precisam ser textos nao vazios")
+    if len({answer.strip().casefold() for answer in data["alternatives"]}) != 4:
+        raise ValueError("As alternativas precisam ser diferentes")
 
     if data["correct_answer"] not in data["alternatives"]:
         raise ValueError("Resposta correta precisa estar dentro das alternativas")
@@ -195,9 +207,6 @@ def generate_question(theme, difficulty, asked_questions=None, *, different_from
                 last_error = error
                 print(f"Tentativa {attempt + 1} falhou ao gerar pergunta com Ollama: {error}")
 
-        if different_from is not None:
-            raise RuntimeError("Nao foi possivel gerar outra pergunta") from last_error
-
-        print(f"Todas as tentativas com Ollama falharam. Usando pergunta fake. Ultimo erro: {last_error}")
+        raise QuestionGenerationError("Nao foi possivel gerar a pergunta com Ollama") from last_error
 
     return generate_fake_question(theme, difficulty, replacement=different_from is not None)

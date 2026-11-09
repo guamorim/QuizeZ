@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
-from app.ai_questions import generate_question
+from app.ai_questions import QuestionGenerationError, generate_question
 from app.game_functions import (
     answer_question,
     create_room,
@@ -272,14 +272,33 @@ async def select_room_theme(room_code: str, payload: SelectThemeRequest):
 
 @app.post("/rooms/{room_code}/difficulty")
 async def select_room_difficulty(room_code: str, payload: SelectDifficultyRequest):
-    room = await select_difficulty(room_code, payload.player_id, payload.difficulty)
+    room = select_difficulty(room_code, payload.player_id, payload.difficulty)
 
     if room is None:
         raise HTTPException(status_code=400, detail="Nao foi possivel escolher essa dificuldade")
-    
-    schedule_question_timeout(room_code, room["current_question"]["id"])
-    
-    await broadcast_room(room_code)
+
+    turn_number = room["turn_number"]
+    theme = room["selected_theme"]
+    asked_questions = room["asked_questions"].copy()
+    question = None
+    try:
+        await broadcast_room(room_code)
+        question = await asyncio.to_thread(generate_question, theme, payload.difficulty, asked_questions)
+    except QuestionGenerationError:
+        pass
+    finally:
+        # The player can leave or the turn can advance while Ollama is working.
+        still_current = get_room(room_code) is room and room["turn_number"] == turn_number
+        if still_current:
+            if question is None:
+                room["question_generation_status"] = "failed"
+            else:
+                set_current_question(room, question)
+                schedule_question_timeout(room_code, question["id"])
+            await broadcast_room(room_code)
+
+    if not still_current:
+        raise HTTPException(status_code=409, detail="O turno ja mudou")
 
     return serialize_room(room)
 
@@ -331,7 +350,7 @@ async def regenerate_room_question(room_code: str, payload: RegenerateQuestionRe
             room["asked_questions"].copy(),
             different_from=question["question"],
         )
-    except RuntimeError as error:
+    except QuestionGenerationError as error:
         raise HTTPException(
             status_code=503,
             detail="Nao foi possivel gerar outra pergunta. O tempo da anterior foi retomado.",

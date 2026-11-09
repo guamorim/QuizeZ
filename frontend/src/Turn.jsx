@@ -22,11 +22,17 @@ export default function Turn({ room, playerId, connected, busy, onRemovePlayer }
   const selectedTheme = room.selected_theme;
   const difficulty = room.selected_difficulty;
   const questionReady = Boolean(room.current_question);
-  const generating = !questionReady && (pending === "difficulty" || (difficulty && !failure));
-  const phase = questionReady ? "question" : generating ? "generating" : selectedTheme ? "difficulty" : "theme";
+  const generationStatus = room.question_generation_status;
+  const generating = pending === "difficulty" || generationStatus === "generating";
+  const phase = questionReady ? "question"
+    : generating ? "generating"
+    : generationStatus === "failed" ? "retry"
+    : selectedTheme ? "difficulty"
+    : "theme";
 
   async function choose(action, fields) {
-    if (!yourTurn || !connected || busy || phase !== action || request.current === action) return;
+    const expectedAction = phase === "retry" ? "difficulty" : phase;
+    if (!yourTurn || !connected || busy || expectedAction !== action || request.current) return;
 
     request.current = action;
     setPending(action);
@@ -38,11 +44,10 @@ export default function Turn({ room, playerId, connected, busy, onRemovePlayer }
         errors[action],
       );
     } catch (error) {
-      if (request.current === action) {
-        request.current = "";
-        setPending("");
-        setFailure({ action, message: error.message });
-      }
+      setFailure({ phase, message: error.message });
+    } finally {
+      request.current = "";
+      setPending("");
     }
   }
 
@@ -55,7 +60,7 @@ export default function Turn({ room, playerId, connected, busy, onRemovePlayer }
     );
   }
 
-  const disabled = !connected || Boolean(busy);
+  const disabled = !connected || Boolean(busy) || Boolean(pending);
   return (
     <section className="turn-panel" aria-labelledby="turn-title">
       <h3 id="turn-title" className="turn-title">{yourTurn ? "Sua vez" : "Vez de " + player.name}</h3>
@@ -68,7 +73,9 @@ export default function Turn({ room, playerId, connected, busy, onRemovePlayer }
           {difficulty && <span> · {difficulties[difficulty]}</span>}
         </p>
       )}
-      {failure?.action === phase && <p className="error" role="alert">{failure.message}</p>}
+      {phase !== "retry" && failure?.phase === phase && (
+        <p className="error" role="alert">{failure.message}</p>
+      )}
 
       {phase === "theme" && (
         yourTurn ? (
@@ -80,7 +87,7 @@ export default function Turn({ room, playerId, connected, busy, onRemovePlayer }
                   key={theme}
                   type="button"
                   className="secondary"
-                  disabled={disabled || pending === "theme"}
+                  disabled={disabled}
                   onClick={() => choose("theme", { theme })}
                 >
                   {theme}
@@ -113,6 +120,25 @@ export default function Turn({ room, playerId, connected, busy, onRemovePlayer }
       )}
 
       {phase === "generating" && <p className="turn-hint" role="status">Gerando pergunta…</p>}
+      {phase === "retry" && (
+        <>
+          <p className="error" role={yourTurn ? "alert" : "status"}>
+            {failure?.phase === phase ? failure.message : "Não foi possível gerar a pergunta."}
+          </p>
+          {yourTurn && (
+            <div className="turn-options">
+              <button
+                type="button"
+                className="secondary"
+                disabled={disabled}
+                onClick={() => choose("difficulty", { difficulty })}
+              >
+                Tentar novamente
+              </button>
+            </div>
+          )}
+        </>
+      )}
       {phase === "question" && (
         <>
           <p className="turn-hint" role="status">Pergunta em andamento.</p>

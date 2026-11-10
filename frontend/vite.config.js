@@ -3,18 +3,22 @@ import { defineConfig } from "vite";
 
 const backend = "http://127.0.0.1:8000";
 
-export default defineConfig(({ command }) => ({
-  base: command === "build" ? "/static/react/" : "/",
-  plugins: [react()],
-  build: {
-    outDir: "../static/react",
-    emptyOutDir: true,
-  },
-  server: {
-    proxy: {
-      "/rooms": backend,
-      "/ws": { target: backend, ws: true },
-      "/static": backend,
+export default defineConfig(({ command, mode }) => {
+  const useVercelRouting = mode === "vercel";
+
+  return {
+    base: command === "build" && !useVercelRouting ? "/static/react/" : "/",
+    plugins: [react()],
+    build: {
+      outDir: useVercelRouting ? "dist" : "../static/react",
+      emptyOutDir: true,
     },
-  },
-}));
+    server: useVercelRouting ? undefined : {
+      proxy: {
+        "/rooms": backend,
+        "/ws": { target: backend, ws: true },
+        "/static": backend,
+      },
+    },
+  };
+});

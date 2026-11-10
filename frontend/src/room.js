@@ -42,6 +42,14 @@ export async function postRoom(path, body, fallback) {
   return data;
 }
 
+export function postRoomAction(session, action, fields, fallback) {
+  return postRoom(
+    "/rooms/" + encodeURIComponent(session.code) + "/" + action,
+    { ...fields, player_id: session.playerId, session_token: session.token },
+    fallback,
+  );
+}
+
 export function useRoom() {
   const [session, setSession] = useState(readSession);
   const [room, setRoom] = useState(null);

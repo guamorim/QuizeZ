@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import QuestionDialog from "./QuestionDialog.jsx";
-import { postRoom } from "./room.js";
+import { postRoomAction } from "./room.js";
 
 const difficulties = {
   facil: "Fácil",
@@ -13,10 +13,11 @@ const errors = {
   difficulty: "Não foi possível escolher essa dificuldade.",
 };
 
-export default function Turn({ room, playerId, connected, busy, onRemovePlayer }) {
+export default function Turn({ room, session, connected, busy, onRemovePlayer }) {
   const [pending, setPending] = useState("");
   const [failure, setFailure] = useState(null);
   const request = useRef("");
+  const { playerId } = session;
   const player = room.current_player;
   const yourTurn = player?.id === playerId;
   const selectedTheme = room.selected_theme;
@@ -38,11 +39,7 @@ export default function Turn({ room, playerId, connected, busy, onRemovePlayer }
     setPending(action);
     setFailure(null);
     try {
-      await postRoom(
-        "/rooms/" + encodeURIComponent(room.code) + "/" + action,
-        { player_id: playerId, ...fields },
-        errors[action],
-      );
+      await postRoomAction(session, action, fields, errors[action]);
     } catch (error) {
       setFailure({ phase, message: error.message });
     } finally {
@@ -145,9 +142,8 @@ export default function Turn({ room, playerId, connected, busy, onRemovePlayer }
           {connected && (
             <QuestionDialog
               question={room.current_question}
-              roomCode={room.code}
               player={player}
-              playerId={playerId}
+              session={session}
               difficultyLabel={difficulties[difficulty]}
               busy={busy}
               onRemovePlayer={room.host_id === playerId && !yourTurn ? onRemovePlayer : null}

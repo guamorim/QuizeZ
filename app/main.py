@@ -1,135 +1,67 @@
-import json
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
-from pydantic import BaseModel
-from fastapi.staticfiles import StaticFiles
 import asyncio
-from datetime import datetime, timedelta, timezone
+import json
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from secrets import token_hex
+from time import time
 from urllib.parse import urlencode
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from redis.exceptions import RedisError
 
 from app.ai_questions import QuestionGenerationError, generate_question
 from app.game_functions import (
+    SOCKET_HEARTBEAT_SECONDS,
     answer_question,
+    connect_player,
     create_room,
+    disconnect_player,
+    finish_generation,
     get_current_player,
-    get_room,
     get_session_player,
     join_room,
     leave_room,
-    next_turn,
+    next_room_deadline,
+    question_deadline,
     restart_game,
     select_difficulty,
     select_theme,
     serialize_room,
-    set_current_question,
     start_game,
-    timeout_question,
+    start_generation,
     update_room_settings,
 )
+from app.room_store import RoomStore, RoomStoreUnavailable
 
-app = FastAPI()
+
+rooms = RoomStore()
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
-websocket_connections = {}
-QUESTION_TIME_LIMIT = 30
-DISCONNECT_GRACE_PERIOD = 10
-question_timeout_tasks = {}
-disconnect_tasks = {}
 
-def room_update_message(room):
-    if room is None:
-        return json.dumps({"type": "room_closed"})
-    return json.dumps({"type": "room_updated", "room": serialize_room(room)})
 
-async def broadcast_room(room_code):
-    connections = websocket_connections.get(room_code.upper(), {})
-    sockets = [socket for player_sockets in connections.values() for socket in player_sockets]
-    if not sockets:
-        return
+@asynccontextmanager
+async def lifespan(_app):
+    try:
+        yield
+    finally:
+        await rooms.close()
 
-    message = room_update_message(get_room(room_code))
 
-    for websocket in sockets:
-        try:
-            await websocket.send_text(message)
-        except (WebSocketDisconnect, OSError, RuntimeError):
-            continue
+app = FastAPI(lifespan=lifespan)
 
-async def expire_question_later(room_code, question_id, time_limit):
-    await asyncio.sleep(time_limit)
 
-    room = timeout_question(room_code, question_id)
-
-    if room is not None:
-        await broadcast_room(room_code)
-
-def schedule_question_timeout(room_code, question_id, time_limit=None):
-    old_task = question_timeout_tasks.get(room_code.upper())
-
-    if old_task is not None:
-        old_task.cancel()
-
-    room = get_room(room_code)
-    if time_limit is None:
-        time_limit = room.get("question_time_limit", QUESTION_TIME_LIMIT) if room else QUESTION_TIME_LIMIT
-
-    if room is not None and room["current_question"] is not None:
-        room["current_question"]["expires_at"] = (
-            datetime.now(timezone.utc) + timedelta(seconds=time_limit)
-        ).isoformat()
-
-    question_timeout_tasks[room_code.upper()] = asyncio.create_task(
-        expire_question_later(room_code, question_id, time_limit)
+@app.exception_handler(RedisError)
+@app.exception_handler(RoomStoreUnavailable)
+async def handle_room_store_error(_request, error):
+    detail = (
+        str(error) if isinstance(error, RoomStoreUnavailable)
+        else "O armazenamento das salas esta indisponivel. Tente novamente."
     )
-    
-def cancel_question_timeout(room_code):
-    task = question_timeout_tasks.pop(room_code.upper(), None)
-
-    if task is not None:
-        task.cancel()
+    return JSONResponse(status_code=503, content={"detail": detail})
 
 
-def cancel_disconnect_timeout(room_code, player_id):
-    task = disconnect_tasks.pop((room_code, player_id), None)
-    if task is not None:
-        task.cancel()
-
-
-async def expire_disconnected_player(room_code, room, player):
-    await asyncio.sleep(DISCONNECT_GRACE_PERIOD)
-    player_id = player["id"]
-    disconnect_tasks.pop((room_code, player_id), None)
-
-    if get_room(room_code) is not room or player_id not in room["player_tokens"]:
-        return
-    if player["connection_status"] != "reconnecting":
-        return
-
-    player["connection_status"] = "offline"
-    if room["status"] == "playing" and get_current_player(room) is player:
-        next_turn(room_code)
-        cancel_question_timeout(room_code)
-
-    await broadcast_room(room_code)
-
-
-async def remove_player_from_room(room_code, player_id):
-    room_code = room_code.upper()
-    room = leave_room(room_code, player_id)
-    cancel_disconnect_timeout(room_code, player_id)
-    if room is None or room["current_question"] is None:
-        cancel_question_timeout(room_code)
-
-    connections = websocket_connections.get(room_code, {})
-    for websocket in tuple(connections.get(player_id, ())):
-        try:
-            await websocket.close(code=4403)
-        except (WebSocketDisconnect, OSError, RuntimeError):
-            continue
-
-    await broadcast_room(room_code)
-    return room
-        
 # Old invite links must be matched before the static file mount.
 @app.get("/static/index.html", include_in_schema=False)
 def redirect_legacy_invite(room: str | None = None):
@@ -139,46 +71,103 @@ def redirect_legacy_invite(room: str | None = None):
     return RedirectResponse(destination)
 
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 class CreateRoomRequest(BaseModel):
     host_name: str
 
+
 class JoinRoomRequest(BaseModel):
     player_name: str
 
-class StartGameRequest(BaseModel):
-    player_id: str
-
-class SelectThemeRequest(BaseModel):
-    player_id: str
-    theme: str
-
-class SelectDifficultyRequest(BaseModel):
-    player_id: str
-    difficulty: str
-
-class RegenerateQuestionRequest(BaseModel):
-    player_id: str
-    question_id: str
-
-class AnswerQuestionRequest(BaseModel):
-    player_id: str
-    answer: str
-    question_id: str | None = None
 
 class PlayerSessionRequest(BaseModel):
     player_id: str
     session_token: str
 
+
+class SelectThemeRequest(PlayerSessionRequest):
+    theme: str
+
+
+class SelectDifficultyRequest(PlayerSessionRequest):
+    difficulty: str
+
+
+class RegenerateQuestionRequest(PlayerSessionRequest):
+    question_id: str
+
+
+class AnswerQuestionRequest(PlayerSessionRequest):
+    answer: str
+    question_id: str
+
+
 class RemovePlayerRequest(PlayerSessionRequest):
     target_player_id: str
 
-class UpdateRoomSettingsRequest(BaseModel):
-    player_id: str
+
+class UpdateRoomSettingsRequest(PlayerSessionRequest):
     points_to_win: int
     question_time_limit: int
+
+
+def require_room_session(room, payload: PlayerSessionRequest):
+    if room is None:
+        raise HTTPException(status_code=404, detail="Sala nao encontrada")
+    player = get_session_player(room, payload.player_id, payload.session_token)
+    if player is None:
+        raise HTTPException(status_code=403, detail="Sessao do jogador invalida")
+    return player
+
+
+def session_response(room, player_id):
+    return {
+        "room": serialize_room(room),
+        "player_id": player_id,
+        "session_token": room["player_tokens"][player_id],
+    }
+
+
+async def apply_player_action(room_code, payload, action, error, status_code=400):
+    def change(room, _now):
+        player = require_room_session(room, payload)
+        if action(room, player["id"]) is None:
+            raise HTTPException(status_code=status_code, detail=error)
+
+    room, _ = await rooms.update(room_code, change)
+    return serialize_room(room)
+
+
+async def generate_for_room(room_code, room, generation_id, *, previous_question=None):
+    question = None
+    try:
+        question = await asyncio.to_thread(
+            generate_question,
+            room["selected_theme"],
+            room["selected_difficulty"],
+            room["asked_questions"],
+            different_from=previous_question,
+        )
+    except QuestionGenerationError:
+        pass
+    finally:
+        # The saved generation ID prevents a late result from replacing another turn.
+        room, applied = await rooms.update(
+            room_code, lambda state, now: finish_generation(state, generation_id, question, now)
+        )
+
+    if not applied:
+        raise HTTPException(status_code=409, detail="A geracao ja expirou ou o turno mudou")
+    if previous_question is not None and question is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Nao foi possivel gerar outra pergunta. O tempo da anterior foi retomado.",
+        )
+    return serialize_room(room)
+
 
 @app.get("/", include_in_schema=False)
 def home():
@@ -201,181 +190,126 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"message": "Servidor do quizeZ rodando"}
-
-
+    rooms.check_config()
+    return {
+        "message": "Servidor do quizeZ rodando",
+        "room_store": "redis" if rooms.redis is not None else "memory",
+    }
 
 
 @app.get("/rooms/{room_code}")
-def read_room(room_code: str):
-    room = get_room(room_code)
-
+async def read_room(room_code: str):
+    room, _ = await rooms.update(room_code)
     if room is None:
         raise HTTPException(status_code=404, detail="Sala nao encontrada")
-
     return serialize_room(room)
+
 
 @app.post("/rooms")
 async def create_new_room(payload: CreateRoomRequest):
-    room, host_id = create_room(payload.host_name)
+    for _ in range(8):
+        room, host_id = create_room(payload.host_name)
+        if room is None:
+            raise HTTPException(status_code=400, detail="Nome do host invalido")
+        if await rooms.create(room):
+            return session_response(room, host_id)
+    raise HTTPException(status_code=503, detail="Nao foi possivel reservar um codigo de sala")
 
-    if room is None:
-        raise HTTPException(status_code=400, detail="Nome do host invalido")
-
-    session_token = room["player_tokens"][host_id]
-    await broadcast_room(room["code"])
-
-    return {
-        "room": serialize_room(room),
-        "player_id": host_id,
-        "session_token": session_token,
-    }
 
 @app.post("/rooms/{room_code}/join")
 async def join_existing_room(room_code: str, payload: JoinRoomRequest):
-    room, player_id = join_room(room_code, payload.player_name)
+    def join(room, _now):
+        _, player_id = join_room(room, payload.player_name)
+        if player_id is None:
+            raise HTTPException(status_code=400, detail="Sala nao encontrada ou nome invalido/repetido")
+        return player_id
 
-    if room is None:
-        raise HTTPException(status_code=400, detail="Sala nao encontrada ou nome invalido/repetido")
+    room, player_id = await rooms.update(room_code, join)
+    return session_response(room, player_id)
 
-    session_token = room["player_tokens"][player_id]
-    
-    await broadcast_room(room_code)
-
-    return {
-        "room": serialize_room(room),
-        "player_id": player_id,
-        "session_token": session_token,
-    }
 
 @app.post("/rooms/{room_code}/start")
-async def start_existing_game(room_code: str, payload: StartGameRequest):
-    room = start_game(room_code, payload.player_id)
+async def start_existing_game(room_code: str, payload: PlayerSessionRequest):
+    return await apply_player_action(
+        room_code, payload, start_game, "Apenas o host pode iniciar a partida no lobby", 403
+    )
 
-    if room is None:
-        raise HTTPException(status_code=403, detail="Apenas o host pode iniciar a partida")
-    
-    await broadcast_room(room_code)
-
-    return serialize_room(room)
 
 @app.post("/rooms/{room_code}/theme")
 async def select_room_theme(room_code: str, payload: SelectThemeRequest):
-    room = select_theme(room_code, payload.player_id, payload.theme)
+    return await apply_player_action(
+        room_code, payload, lambda room, player_id: select_theme(room, player_id, payload.theme),
+        "Nao foi possivel escolher esse tema",
+    )
 
-    if room is None:
-        raise HTTPException(status_code=400, detail="Nao foi possivel escolher esse tema")
-    
-    await broadcast_room(room_code)
-
-    return serialize_room(room)
 
 @app.post("/rooms/{room_code}/difficulty")
 async def select_room_difficulty(room_code: str, payload: SelectDifficultyRequest):
-    room = select_difficulty(room_code, payload.player_id, payload.difficulty)
+    def begin(room, now):
+        player = require_room_session(room, payload)
+        if select_difficulty(room, player["id"], payload.difficulty) is None:
+            raise HTTPException(status_code=400, detail="Nao foi possivel escolher essa dificuldade")
+        return start_generation(room, now)
 
-    if room is None:
-        raise HTTPException(status_code=400, detail="Nao foi possivel escolher essa dificuldade")
+    room, generation_id = await rooms.update(room_code, begin)
+    return await generate_for_room(room_code, room, generation_id)
 
-    turn_number = room["turn_number"]
-    theme = room["selected_theme"]
-    asked_questions = room["asked_questions"].copy()
-    question = None
-    try:
-        await broadcast_room(room_code)
-        question = await asyncio.to_thread(generate_question, theme, payload.difficulty, asked_questions)
-    except QuestionGenerationError:
-        pass
-    finally:
-        # The player can leave or the turn can advance while Ollama is working.
-        still_current = get_room(room_code) is room and room["turn_number"] == turn_number
-        if still_current:
-            if question is None:
-                room["question_generation_status"] = "failed"
-            else:
-                set_current_question(room, question)
-                schedule_question_timeout(room_code, question["id"])
-            await broadcast_room(room_code)
-
-    if not still_current:
-        raise HTTPException(status_code=409, detail="O turno ja mudou")
-
-    return serialize_room(room)
 
 @app.post("/rooms/{room_code}/answer")
 async def answer_room_question(room_code: str, payload: AnswerQuestionRequest):
-    room = answer_question(room_code, payload.player_id, payload.answer, payload.question_id)
+    return await apply_player_action(
+        room_code, payload,
+        lambda room, player_id: answer_question(room, player_id, payload.answer, payload.question_id),
+        "Nao foi possivel responder essa pergunta",
+    )
 
-    if room is None:
-        raise HTTPException(status_code=400, detail="Nao foi possivel responder essa pergunta")
-
-    cancel_question_timeout(room_code)
-
-    await broadcast_room(room_code)
-
-    return serialize_room(room)
 
 @app.post("/rooms/{room_code}/regenerate")
 async def regenerate_room_question(room_code: str, payload: RegenerateQuestionRequest):
-    room = get_room(room_code)
-    if room is None:
-        raise HTTPException(status_code=404, detail="Sala nao encontrada")
+    def begin(room, now):
+        player = require_room_session(room, payload)
+        question = room["current_question"]
+        if room["status"] != "playing" or question is None or question["id"] != payload.question_id:
+            raise HTTPException(status_code=409, detail="A pergunta ja mudou")
+        if get_current_player(room) is not player:
+            raise HTTPException(status_code=403, detail="Apenas o jogador da vez pode trocar a pergunta")
+        if question.get("regenerated") or question.get("regenerating"):
+            raise HTTPException(status_code=409, detail="Cada pergunta pode ser trocada uma vez")
+        remaining_time = question_deadline(question) - now
+        if remaining_time <= 0:
+            raise HTTPException(status_code=409, detail="O tempo desta pergunta ja acabou")
 
-    question = room["current_question"]
-    if room["status"] != "playing" or question is None or question["id"] != payload.question_id:
-        raise HTTPException(status_code=409, detail="A pergunta ja mudou")
+        question["regenerating"] = True
+        return start_generation(room, now, remaining_time=remaining_time)
 
-    current_player = get_current_player(room)
-    if current_player is None or current_player["id"] != payload.player_id:
-        raise HTTPException(status_code=403, detail="Apenas o jogador da vez pode trocar a pergunta")
+    room, generation_id = await rooms.update(room_code, begin)
+    return await generate_for_room(
+        room_code, room, generation_id, previous_question=room["current_question"]["question"]
+    )
 
-    if question.get("regenerated") or question.get("regenerating"):
-        raise HTTPException(status_code=409, detail="Cada pergunta pode ser trocada uma vez")
 
-    deadline = datetime.fromisoformat(question["expires_at"])
-    remaining_time = (deadline - datetime.now(timezone.utc)).total_seconds()
-    if remaining_time <= 0:
-        raise HTTPException(status_code=409, detail="O tempo desta pergunta ja acabou")
+async def wait_for_disconnect(websocket):
+    while (await websocket.receive())["type"] != "websocket.disconnect":
+        pass
 
-    question["regenerating"] = True
-    cancel_question_timeout(room_code)
-    replacement = None
 
+async def wait_for_room_update(wait_for_change, disconnect, timeout):
+    change = asyncio.create_task(wait_for_change(timeout))
     try:
-        await broadcast_room(room_code)
-        replacement = await asyncio.to_thread(
-            generate_question,
-            question["theme"],
-            question["difficulty"],
-            room["asked_questions"].copy(),
-            different_from=question["question"],
-        )
-    except QuestionGenerationError as error:
-        raise HTTPException(
-            status_code=503,
-            detail="Nao foi possivel gerar outra pergunta. O tempo da anterior foi retomado.",
-        ) from error
+        await asyncio.wait((change, disconnect), return_when=asyncio.FIRST_COMPLETED)
+        if disconnect.done():
+            await disconnect
+            return False
+        await change
+        return True
     finally:
-        # A room or turn can change while the model is generating.
-        still_current = get_room(room_code) is room and room["current_question"] is question
-        if still_current:
-            question.pop("regenerating", None)
-            if replacement is None:
-                schedule_question_timeout(room_code, question["id"], remaining_time)
-            else:
-                set_current_question(room, replacement, regenerated=True)
-                schedule_question_timeout(room_code, replacement["id"])
-            await broadcast_room(room_code)
+        change.cancel()
+        await asyncio.gather(change, return_exceptions=True)
 
-    if not still_current:
-        raise HTTPException(status_code=409, detail="A pergunta ja mudou")
-
-    return serialize_room(room)
 
 @app.websocket("/ws/{room_code}")
 async def room_websocket(websocket: WebSocket, room_code: str):
     await websocket.accept()
-
     room_code = room_code.upper()
     try:
         credentials = await asyncio.wait_for(websocket.receive_json(), timeout=10)
@@ -386,101 +320,105 @@ async def room_websocket(websocket: WebSocket, room_code: str):
     except (WebSocketDisconnect, OSError, RuntimeError):
         return
 
-    room = get_room(room_code)
-    if room is None:
-        await websocket.close(code=4404)
-        return
-
     player_id = payload.player_id
-    player = get_session_player(room, player_id, payload.session_token)
-    if player is None:
-        await websocket.close(code=4403)
-        return
+    connection_id = token_hex(12)
+    disconnect = None
+    registered = False
 
-    connections = websocket_connections.setdefault(room_code, {})
-    player_sockets = connections.setdefault(player_id, [])
-    player_sockets.append(websocket)
-    was_online = player["connection_status"] == "online"
-    player["connection_status"] = "online"
-    cancel_disconnect_timeout(room_code, player_id)
-    if room["status"] == "playing" and get_current_player(room) is None:
-        next_turn(room_code)
+    def session_player(room):
+        return get_session_player(room, player_id, payload.session_token) if room else None
+
+    def renew(room, now):
+        player = session_player(room)
+        if player is not None:
+            connect_player(room, player, connection_id, now)
+        return player is not None
+
+    def release(room, now):
+        if room is not None:
+            disconnect_player(room, player_id, connection_id, now)
 
     try:
-        if was_online:
-            await websocket.send_text(room_update_message(room))
-        else:
-            await broadcast_room(room_code)
-        while True:
-            await websocket.receive_text()
+        room, _ = await rooms.update(room_code)
+        if room is None or session_player(room) is None:
+            await websocket.close(code=4404 if room is None else 4403)
+            return
+
+        async with rooms.subscribe(room_code) as wait_for_change:
+            room, registered = await rooms.update(room_code, renew)
+            disconnect = asyncio.create_task(wait_for_disconnect(websocket))
+            last_message = None
+            renew_at = time() + SOCKET_HEARTBEAT_SECONDS
+            while True:
+                if room is None or session_player(room) is None:
+                    await websocket.close(code=4404 if room is None else 4403)
+                    return
+                message = json.dumps({"type": "room_updated", "room": serialize_room(room)})
+                if message != last_message:
+                    await websocket.send_text(message)
+                    last_message = message
+
+                timeout = max(0, min(renew_at, next_room_deadline(room)) - time())
+                if not await wait_for_room_update(wait_for_change, disconnect, timeout):
+                    return
+                if time() >= renew_at:
+                    room, _ = await rooms.update(room_code, renew)
+                    renew_at = time() + SOCKET_HEARTBEAT_SECONDS
+                else:
+                    room, _ = await rooms.update(room_code)
+    except (RedisError, RoomStoreUnavailable):
+        with suppress(WebSocketDisconnect, OSError, RuntimeError):
+            await websocket.close(code=1013)
     except (WebSocketDisconnect, OSError, RuntimeError):
         pass
     finally:
-        player_sockets.remove(websocket)
-        if not player_sockets:
-            del connections[player_id]
-            if not connections:
-                del websocket_connections[room_code]
+        if disconnect is not None:
+            disconnect.cancel()
+            await asyncio.gather(disconnect, return_exceptions=True)
+        if registered:
+            with suppress(RedisError, RoomStoreUnavailable):
+                await rooms.update(room_code, release)
 
-            if get_room(room_code) is room and player_id in room["player_tokens"]:
-                player["connection_status"] = "reconnecting"
-                disconnect_tasks[(room_code, player_id)] = asyncio.create_task(
-                    expire_disconnected_player(room_code, room, player)
-                )
-                await broadcast_room(room_code)
 
 @app.post("/rooms/{room_code}/leave")
 async def leave_existing_room(room_code: str, payload: PlayerSessionRequest):
-    room = get_room(room_code)
-    if room is None or payload.player_id not in room["player_tokens"]:
-        return {"room": None}
-    if get_session_player(room, payload.player_id, payload.session_token) is None:
-        raise HTTPException(status_code=403, detail="Sessao do jogador invalida")
+    def remove(room, _now):
+        if room is not None and payload.player_id in room["player_tokens"]:
+            player = require_room_session(room, payload)
+            leave_room(room, player["id"])
 
-    room = await remove_player_from_room(room_code, payload.player_id)
+    room, _ = await rooms.update(room_code, remove)
     return {"room": serialize_room(room)}
+
 
 @app.post("/rooms/{room_code}/kick")
 async def kick_room_player(room_code: str, payload: RemovePlayerRequest):
-    room = get_room(room_code)
-    if room is None:
-        raise HTTPException(status_code=404, detail="Sala nao encontrada")
-    host = get_session_player(room, payload.player_id, payload.session_token)
-    if host is None or not host["is_host"]:
-        raise HTTPException(status_code=403, detail="Apenas o host pode remover jogadores")
-    if payload.target_player_id == payload.player_id:
-        raise HTTPException(status_code=400, detail="Use Sair da sala para remover seu jogador")
-    if payload.target_player_id not in room["player_tokens"]:
-        raise HTTPException(status_code=404, detail="Jogador nao encontrado")
+    def kick(room, _now):
+        host = require_room_session(room, payload)
+        if not host["is_host"]:
+            raise HTTPException(status_code=403, detail="Apenas o host pode remover jogadores")
+        if payload.target_player_id == host["id"]:
+            raise HTTPException(status_code=400, detail="Use Sair da sala para remover seu jogador")
+        if leave_room(room, payload.target_player_id) is None:
+            raise HTTPException(status_code=404, detail="Jogador nao encontrado")
 
-    room = await remove_player_from_room(room_code, payload.target_player_id)
+    room, _ = await rooms.update(room_code, kick)
     return serialize_room(room)
+
 
 @app.post("/rooms/{room_code}/restart")
-async def restart_existing_game(room_code: str, payload: StartGameRequest):
-    room = restart_game(room_code, payload.player_id)
+async def restart_existing_game(room_code: str, payload: PlayerSessionRequest):
+    return await apply_player_action(
+        room_code, payload, restart_game, "Apenas o host pode reiniciar uma partida encerrada", 403
+    )
 
-    if room is None:
-        raise HTTPException(status_code=403, detail="Apenas o host pode reiniciar a partida")
-
-    cancel_question_timeout(room_code)
-    
-    await broadcast_room(room_code)
-
-    return serialize_room(room)
 
 @app.post("/rooms/{room_code}/settings")
 async def update_existing_room_settings(room_code: str, payload: UpdateRoomSettingsRequest):
-    room = update_room_settings(
-        room_code,
-        payload.player_id,
-        payload.points_to_win,
-        payload.question_time_limit,
-)
-
-    if room is None:
-        raise HTTPException(status_code=400, detail="Nao foi possivel atualizar as configuracoes")
-
-    await broadcast_room(room_code)
-
-    return serialize_room(room)
+    return await apply_player_action(
+        room_code, payload,
+        lambda room, player_id: update_room_settings(
+            room, player_id, payload.points_to_win, payload.question_time_limit
+        ),
+        "Nao foi possivel atualizar as configuracoes",
+    )

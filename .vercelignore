@@ -1,0 +1,8 @@
+.env
+.env.*
+ngrok-ollama.local.yml
+.venv/
+venv/
+venv_old/
+frontend/dist/
+static/react/

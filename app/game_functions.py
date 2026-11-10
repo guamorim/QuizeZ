@@ -1,7 +1,7 @@
+from datetime import datetime, timezone
 from random import choice, sample
 from secrets import compare_digest, token_hex
 
-rooms = {}
 THEMES_POOL = [
     "Historia",
     "Geografia",
@@ -37,6 +37,10 @@ POINTS_BY_DIFFICULTY = {
 
 POINTS_TO_WIN = 25
 DEFAULT_QUESTION_TIME_LIMIT = 30
+DISCONNECT_GRACE_PERIOD = 10
+SOCKET_HEARTBEAT_SECONDS = 10
+SOCKET_LEASE_SECONDS = 30
+QUESTION_GENERATION_SECONDS = 210
 
 def generate_room_code():
     return token_hex(3).upper()
@@ -47,13 +51,13 @@ def create_room(host_name):
 
     if not host_name:
         return None, None
-    
+
     room_code = generate_room_code()
     host_id = token_hex(8)
 
-    rooms[room_code] = {
+    room = {
         "code": room_code,
-        "host_id": host_id, 
+        "host_id": host_id,
         "status": "waiting",
         "players": [
             {
@@ -65,25 +69,25 @@ def create_room(host_name):
             }
         ],
         "player_tokens": {host_id: token_hex(24)},
+        "connections": {},
+        "reconnect_deadlines": {},
         "current_player_index": None,
         "turn_number": 0,
         "available_themes": [],
         "selected_theme": None,
         "selected_difficulty": None,
         "question_generation_status": None,
+        "generation": None,
         "current_question": None,
         "last_answer_result": None,
         "winner": None,
         "asked_questions": [],
         "points_to_win": POINTS_TO_WIN,
         "question_time_limit": DEFAULT_QUESTION_TIME_LIMIT,
-    
+
     }
 
-    return rooms[room_code], host_id
-
-def get_room(room_code):
-    return rooms.get(room_code.upper())
+    return room, host_id
 
 
 def get_session_player(room, player_id, session_token):
@@ -94,9 +98,7 @@ def get_session_player(room, player_id, session_token):
     return next((player for player in room["players"] if player["id"] == player_id), None)
 
 
-def join_room(room_code, player_name):
-    room = get_room(room_code)
-
+def join_room(room, player_name):
     if room is None:
         return None, None
 
@@ -104,11 +106,11 @@ def join_room(room_code, player_name):
 
     if not player_name:
         return None, None
-    
+
     for player in room["players"]:
         if player["name"].lower() == player_name.lower():
             return None, None
-        
+
     player_id = token_hex(8)
 
     room["players"].append(
@@ -135,6 +137,7 @@ def prepare_turn(room, player_index):
     room["selected_theme"] = None
     room["selected_difficulty"] = None
     room["question_generation_status"] = None
+    room["generation"] = None
     room["current_question"] = None
 
 
@@ -157,13 +160,8 @@ def advance_turn(room, start_index):
     prepare_turn(room, None)
 
 
-def start_game(room_code, player_id):
-    room = get_room(room_code)
-
-    if room is None:
-        return None
-
-    if room["host_id"] != player_id:
+def start_game(room, player_id):
+    if room["host_id"] != player_id or room["status"] != "waiting":
         return None
 
     room["status"] = "playing"
@@ -187,6 +185,9 @@ def serialize_room(room):
     room_data = room.copy()
     room_data.pop("asked_questions", None)
     room_data.pop("player_tokens", None)
+    room_data.pop("connections", None)
+    room_data.pop("reconnect_deadlines", None)
+    room_data.pop("generation", None)
     room_data["current_player"] = get_current_player(room)
 
     if room_data["current_question"] is not None:
@@ -196,12 +197,7 @@ def serialize_room(room):
 
     return room_data
 
-def select_theme(room_code, player_id, theme):
-    room = get_room(room_code)
-
-    if room is None:
-        return None
-
+def select_theme(room, player_id, theme):
     if room["status"] != "playing":
         return None
 
@@ -224,23 +220,28 @@ def select_theme(room_code, player_id, theme):
     return room
 
 
-def set_current_question(room, question, *, regenerated=False):
+def set_question_deadline(question, deadline):
+    question["expires_at"] = datetime.fromtimestamp(deadline, timezone.utc).isoformat()
+
+
+def question_deadline(question):
+    return datetime.fromisoformat(question["expires_at"]).timestamp()
+
+
+def set_current_question(room, question, now, *, regenerated=False):
+    question = question.copy()
     question["id"] = token_hex(8)
     question["regenerated"] = regenerated
     base_points = POINTS_BY_DIFFICULTY[question["difficulty"]]
     question["points"] = max(1, base_points - 1) if regenerated else base_points
+    set_question_deadline(question, now + room["question_time_limit"])
     room["current_question"] = question
     room["question_generation_status"] = None
     room["asked_questions"].append(question["question"])
+    del room["asked_questions"][:-10]
 
 
-def select_difficulty(room_code, player_id, difficulty):
-
-    room = get_room(room_code)
-
-    if room is None:
-        return None
-
+def select_difficulty(room, player_id, difficulty):
     if room["status"] != "playing":
         return None
 
@@ -254,7 +255,7 @@ def select_difficulty(room_code, player_id, difficulty):
 
     if room["selected_theme"] is None:
         return None
-    
+
     if difficulty not in POINTS_BY_DIFFICULTY:
         return None
 
@@ -268,24 +269,14 @@ def select_difficulty(room_code, player_id, difficulty):
     room["question_generation_status"] = "generating"
     return room
 
-def next_turn(room_code):
-    room = get_room(room_code)
-
-    if room is None:
-        return None
-
+def next_turn(room):
     current_index = room["current_player_index"]
     advance_turn(room, 0 if current_index is None else current_index + 1)
 
     return room
 
 
-def answer_question(room_code, player_id, answer, question_id=None):
-    room = get_room(room_code)
-
-    if room is None:
-        return None
-
+def answer_question(room, player_id, answer, question_id):
     if room["status"] != "playing":
         return None
 
@@ -301,7 +292,7 @@ def answer_question(room_code, player_id, answer, question_id=None):
     if question is None or question.get("regenerating"):
         return None
 
-    if (question_id is not None or question.get("regenerated")) and question["id"] != question_id:
+    if question["id"] != question_id:
         return None
 
     correct_answer = question["correct_answer"]
@@ -331,16 +322,11 @@ def answer_question(room_code, player_id, answer, question_id=None):
         room["current_question"] = None
         return room
 
-    next_turn(room_code)
+    next_turn(room)
 
     return room
 
-def leave_room(room_code, player_id):
-    room = get_room(room_code)
-
-    if room is None:
-        return None
-
+def leave_room(room, player_id):
     player_index = None
 
     for index, player in enumerate(room["players"]):
@@ -354,9 +340,10 @@ def leave_room(room_code, player_id):
     current_index = room["current_player_index"]
     removed_player = room["players"].pop(player_index)
     del room["player_tokens"][player_id]
+    room["connections"].pop(player_id, None)
+    room["reconnect_deadlines"].pop(player_id, None)
 
     if not room["players"]:
-        del rooms[room["code"]]
         return None
 
     if removed_player["is_host"]:
@@ -373,13 +360,8 @@ def leave_room(room_code, player_id):
 
     return room
 
-def restart_game(room_code, player_id):
-    room = get_room(room_code)
-
-    if room is None:
-        return None
-
-    if room["host_id"] != player_id:
+def restart_game(room, player_id):
+    if room["host_id"] != player_id or room["status"] != "finished":
         return None
 
     for player in room["players"]:
@@ -393,20 +375,12 @@ def restart_game(room_code, player_id):
 
     return room
 
-def timeout_question(room_code, question_id):
-    room = get_room(room_code)
-
-    if room is None:
-        return None
-
+def timeout_question(room):
     if room["status"] != "playing":
         return None
 
     question = room["current_question"]
     if question is None or question.get("regenerating"):
-        return None
-
-    if question.get("id") != question_id:
         return None
 
     current_player = get_current_player(room)
@@ -424,19 +398,14 @@ def timeout_question(room_code, question_id):
         "timed_out": True,
     }
 
-    next_turn(room_code)
+    next_turn(room)
 
     return room
 
 def normalize_player_name(player_name):
     return player_name.strip()
 
-def update_room_settings(room_code, player_id, points_to_win, question_time_limit):
-    room = get_room(room_code)
-
-    if room is None:
-        return None
-
+def update_room_settings(room, player_id, points_to_win, question_time_limit):
     if room["host_id"] != player_id:
         return None
 
@@ -453,3 +422,104 @@ def update_room_settings(room_code, player_id, points_to_win, question_time_limi
     room["question_time_limit"] = question_time_limit
 
     return room
+
+
+def start_generation(room, now, *, remaining_time=None):
+    generation = {
+        "id": token_hex(12),
+        "deadline": now + QUESTION_GENERATION_SECONDS,
+        "remaining_time": remaining_time,
+    }
+    room["generation"] = generation
+    return generation["id"]
+
+
+def finish_generation(room, generation_id, question, now):
+    generation = room["generation"] if room is not None else None
+    if generation is None or generation["id"] != generation_id:
+        return False
+
+    room["generation"] = None
+    remaining_time = generation["remaining_time"]
+    if question is not None:
+        set_current_question(room, question, now, regenerated=remaining_time is not None)
+    elif remaining_time is not None:
+        previous_question = room["current_question"]
+        previous_question.pop("regenerating", None)
+        set_question_deadline(previous_question, now + remaining_time)
+    else:
+        room["question_generation_status"] = "failed"
+    return True
+
+
+def connect_player(room, player, connection_id, now):
+    player_id = player["id"]
+    leases = room["connections"].setdefault(player_id, {})
+    leases[connection_id] = now + SOCKET_LEASE_SECONDS
+    room["reconnect_deadlines"].pop(player_id, None)
+    player["connection_status"] = "online"
+    if room["status"] == "playing" and get_current_player(room) is None:
+        next_turn(room)
+
+
+def disconnect_player(room, player_id, connection_id, now):
+    leases = room["connections"].get(player_id)
+    if not leases or connection_id not in leases:
+        return
+    del leases[connection_id]
+    if not leases:
+        del room["connections"][player_id]
+        player = next(player for player in room["players"] if player["id"] == player_id)
+        player["connection_status"] = "reconnecting"
+        room["reconnect_deadlines"][player_id] = now + DISCONNECT_GRACE_PERIOD
+
+
+def reconcile_room(room, now):
+    active_player = get_current_player(room)
+    active_disconnect_at = None
+    for player in room["players"]:
+        player_id = player["id"]
+        leases = room["connections"].get(player_id)
+        if leases:
+            last_expiry = max(leases.values())
+            for connection_id, expires_at in list(leases.items()):
+                if expires_at <= now:
+                    del leases[connection_id]
+            if not leases:
+                del room["connections"][player_id]
+                player["connection_status"] = "reconnecting"
+                room["reconnect_deadlines"][player_id] = last_expiry + DISCONNECT_GRACE_PERIOD
+        reconnect_at = room["reconnect_deadlines"].get(player_id)
+        if reconnect_at is not None and reconnect_at <= now:
+            del room["reconnect_deadlines"][player_id]
+            player["connection_status"] = "offline"
+            if player is active_player:
+                active_disconnect_at = reconnect_at
+
+    if room["status"] != "playing":
+        return
+    generation = room["generation"]
+    if generation is not None and generation["deadline"] <= now:
+        finish_generation(room, generation["id"], None, generation["deadline"])
+
+    # If both deadlines passed while the room was idle, apply the first one.
+    question = room["current_question"]
+    if question is not None and not question.get("regenerating"):
+        expires_at = question_deadline(question)
+        if expires_at <= now and (active_disconnect_at is None or expires_at <= active_disconnect_at):
+            timeout_question(room)
+            return
+    if active_player is not None and active_player["connection_status"] == "offline":
+        next_turn(room)
+
+
+def next_room_deadline(room):
+    deadlines = list(room["reconnect_deadlines"].values())
+    deadlines.extend(max(leases.values()) for leases in room["connections"].values() if leases)
+    generation = room["generation"]
+    if generation is not None:
+        deadlines.append(generation["deadline"])
+    question = room["current_question"]
+    if question is not None and not question.get("regenerating"):
+        deadlines.append(question_deadline(question))
+    return min(deadlines, default=float("inf"))

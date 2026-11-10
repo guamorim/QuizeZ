@@ -1,6 +1,7 @@
 import json
 import os
 from random import shuffle
+from urllib.parse import urlsplit
 
 import requests
 from dotenv import load_dotenv
@@ -109,7 +110,30 @@ def generate_fake_question(theme, difficulty, *, replacement=False):
     return shuffle_question_alternatives(question)
 
 
+def get_ollama_connection():
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
+    try:
+        url = urlsplit(base_url)
+    except ValueError:
+        raise QuestionGenerationError("OLLAMA_BASE_URL invalida") from None
+
+    if not url.hostname or url.username is not None or url.path not in ("", "/") or url.query or url.fragment:
+        raise QuestionGenerationError("OLLAMA_BASE_URL deve conter apenas o endereco base, sem credenciais")
+
+    endpoint = f"{url.scheme}://{url.netloc}/api/generate"
+    user = os.getenv("OLLAMA_TUNNEL_USER")
+    password = os.getenv("OLLAMA_TUNNEL_PASSWORD")
+
+    if url.scheme == "http" and url.hostname in ("localhost", "127.0.0.1", "::1") and not (user or password):
+        return endpoint, None
+    if url.scheme == "https" and user and password:
+        return endpoint, (user, password)
+
+    raise QuestionGenerationError("O acesso remoto ao Ollama exige HTTPS e as duas credenciais do tunel")
+
+
 def generate_ollama_question(theme, difficulty, asked_questions):
+    endpoint, auth = get_ollama_connection()
     recent_questions = asked_questions[-10:]
 
     avoid_repetition_instruction = ""
@@ -160,14 +184,21 @@ Formato exato:
 """
 
     response = requests.post(
-        "http://localhost:11434/api/generate",
+        endpoint,
         json={
             "model": model,
             "prompt": prompt,
             "stream": False,
         },
+        auth=auth,
+        allow_redirects=False,
         timeout=60,
     )
+
+    if response.status_code in (401, 403):
+        raise QuestionGenerationError("O tunel negou o acesso ao Ollama. Confira a politica e as credenciais.")
+    if 300 <= response.status_code < 400:
+        raise QuestionGenerationError("O endereco do Ollama respondeu com um redirecionamento inesperado")
 
     response.raise_for_status()
 
@@ -203,6 +234,9 @@ def generate_question(theme, difficulty, asked_questions=None, *, different_from
                 ):
                     raise ValueError("O Ollama repetiu a pergunta atual")
                 return question
+            except QuestionGenerationError as error:
+                print(f"Erro ao conectar ao Ollama: {error}")
+                raise
             except Exception as error:
                 last_error = error
                 print(f"Tentativa {attempt + 1} falhou ao gerar pergunta com Ollama: {error}")

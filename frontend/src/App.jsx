@@ -1,6 +1,6 @@
 import { useState } from "react";
 import mark from "./mark.svg";
-import { postRoom, useRoom } from "./room.js";
+import { postRoom, postRoomAction, useRoom } from "./room.js";
 import Scoreboard, { MatchResult } from "./Scoreboard.jsx";
 import Turn from "./Turn.jsx";
 
@@ -189,7 +189,7 @@ function Room({ room, session, busy, connected, feedback, onLeave, onHostAction 
         <Turn
           key={room.turn_number}
           room={room}
-          playerId={session.playerId}
+          session={session}
           connected={connected}
           busy={busy}
           onRemovePlayer={removePlayer}
@@ -245,9 +245,10 @@ export default function App() {
     setFeedback("");
     activateSession(null);
     try {
-      await postRoom(
-        "/rooms/" + encodeURIComponent(session.code) + "/leave",
-        { player_id: session.playerId, session_token: session.token },
+      await postRoomAction(
+        session,
+        "leave",
+        {},
         "Não foi possível avisar o servidor da saída.",
       );
     } catch {
@@ -266,20 +267,15 @@ export default function App() {
     setError("");
     setFeedback("");
 
-    const path = "/rooms/" + encodeURIComponent(session.code) + "/";
-    const player = { player_id: session.playerId };
     try {
       if (action === "start" && (
         fields.points_to_win !== room.points_to_win ||
         fields.question_time_limit !== room.question_time_limit
       )) {
-        await postRoom(path + "settings", { ...player, ...fields }, hostErrors.settings);
+        await postRoomAction(session, "settings", fields, hostErrors.settings);
       }
 
-      let payload = player;
-      if (action === "settings") payload = { ...player, ...fields };
-      if (action === "kick") payload = { ...player, ...fields, session_token: session.token };
-      await postRoom(path + action, payload, hostErrors[action]);
+      await postRoomAction(session, action, action === "start" ? {} : fields, hostErrors[action]);
 
       if (action === "settings") {
         setFeedback("Configurações salvas.");

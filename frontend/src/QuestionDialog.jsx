@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { postRoom } from "./room.js";
+import { postRoomAction } from "./room.js";
 
 function secondsUntil(deadline) {
   return Number.isFinite(deadline)
@@ -41,11 +41,11 @@ const errors = {
   regenerate: "Não foi possível trocar a pergunta.",
 };
 
-function Question({ question, roomCode, player, playerId, difficultyLabel, busy, onRemovePlayer }) {
+function Question({ question, player, session, difficultyLabel, busy, onRemovePlayer }) {
   const [pending, setPending] = useState("");
   const [failure, setFailure] = useState("");
   const request = useRef("");
-  const yourTurn = player.id === playerId;
+  const yourTurn = player.id === session.playerId;
   const regenerating = question.regenerating || pending === "regenerate";
   const seconds = useQuestionTimer(question.expires_at, regenerating);
   const canAnswer = yourTurn && !busy && !pending && !regenerating && seconds > 0;
@@ -60,9 +60,10 @@ function Question({ question, roomCode, player, playerId, difficultyLabel, busy,
     setPending(action);
     setFailure("");
     try {
-      await postRoom(
-        "/rooms/" + encodeURIComponent(roomCode) + "/" + action,
-        { player_id: playerId, question_id: question.id, ...fields },
+      await postRoomAction(
+        session,
+        action,
+        { question_id: question.id, ...fields },
         errors[action],
       );
     } catch (error) {

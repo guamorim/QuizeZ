@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from secrets import token_hex
@@ -38,6 +39,7 @@ from app.room_store import RoomStore, RoomStoreUnavailable
 
 
 rooms = RoomStore()
+logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
@@ -55,6 +57,8 @@ app = FastAPI(lifespan=lifespan)
 @app.exception_handler(RedisError)
 @app.exception_handler(RoomStoreUnavailable)
 async def handle_room_store_error(_request, error):
+    if isinstance(error, RedisError):
+        logger.warning("Redis: falha na requisicao HTTP (%s)", type(error).__name__)
     detail = (
         str(error) if isinstance(error, RoomStoreUnavailable)
         else "O armazenamento das salas esta indisponivel. Tente novamente."
@@ -366,7 +370,8 @@ async def room_websocket(websocket: WebSocket, room_code: str):
                     renew_at = time() + SOCKET_HEARTBEAT_SECONDS
                 else:
                     room, _ = await rooms.update(room_code)
-    except (RedisError, RoomStoreUnavailable):
+    except (RedisError, RoomStoreUnavailable) as error:
+        logger.warning("Armazenamento da sala: falha no WebSocket (%s)", type(error).__name__)
         with suppress(WebSocketDisconnect, OSError, RuntimeError):
             await websocket.close(code=1013)
     except (WebSocketDisconnect, OSError, RuntimeError):

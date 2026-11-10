@@ -40,7 +40,11 @@ class RoomStore:
         url = os.getenv("REDIS_URL") or os.getenv("KV_URL")
         try:
             self.redis = Redis.from_url(
-                url, decode_responses=True, socket_connect_timeout=5, socket_timeout=15
+                url,
+                protocol=2,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_timeout=15,
             ) if url else None
         except ValueError:
             raise RoomStoreUnavailable("Use a URL TCP do Redis em REDIS_URL, nao a URL REST.") from None
